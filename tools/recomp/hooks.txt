@@ -1,0 +1,8 @@
+# Runtime hooks into Zelda.rpx (Twilight Princess HD, USA v81). Address = function entry.
+029196A0  # dPeekZ_c::peekData: depth peeks answered from GPU readbacks (peekz.cpp; the sun's lens flare)
+02943528  # dFile_select_c state 8, the controller picker opening: the GamePad taken (tp_screen.cpp)
+02944B50  # dFile_select_c state 0x15, Back on the save list: to the title instead of the picker (tp_screen.cpp)
+02AC0390  # dScnName, each frame of its file select: the title asked for after that Back (tp_screen.cpp)
+02008990  # the controller manager's mode setter: mode 3 (GamePad play) in Off-TV Play (tp_screen.cpp)
+02BDE9A4  # Off-TV Play on/off: kept on in GamePad mode (tp_screen.cpp)
+02B06D38  # Off-TV Play's GamePad side: kept on in GamePad mode (tp_screen.cpp)

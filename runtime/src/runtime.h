@@ -1,0 +1,224 @@
+// Internal runtime API shared by the loader, dispatcher, threads and HLE libraries.
+#pragma once
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <string>
+#include <vector>
+
+#include "ppc.h"
+#include "exception_report.h"
+
+// ---- guest memory layout ----
+namespace mem {
+constexpr uint32_t kMem2Start = 0x10000000;   // app data + heap (MEM2)
+constexpr uint32_t kMem2End = 0x50000000;
+constexpr uint32_t kRuntimeStart = 0x60000000; // runtime-owned guest objects (stacks, OS structs)
+constexpr uint32_t kRuntimeEnd = 0x70000000;
+constexpr uint32_t kHostStart = 0x68000000;    // ... of them host-only (not part of save states)
+constexpr uint32_t kFixedStart = 0x6FFF0000;   // fixed slots for small buffers the guest may keep pointers to
+constexpr uint32_t kFixedSize = 0x10000;
+constexpr uint32_t kFgBucket = 0xE0000000;     // foreground bucket
+constexpr uint32_t kFgBucketSize = 0x02800000;
+constexpr uint32_t kMem1 = 0xF4000000;         // MEM1, 32 MiB
+constexpr uint32_t kMem1Size = 0x02000000;
+constexpr uint32_t kHleFuncBase = 0xC2000000;  // synthetic addresses of host functions
+
+void init();
+// bump allocator for runtime-owned guest memory (never freed). Guest-visible objects (the game may
+// keep pointers to them) go through runtime_alloc and are part of save states; scratch memory that
+// only host code uses (shader copies, service thread stacks) through host_alloc.
+uint32_t runtime_alloc(uint32_t size, uint32_t align = 16);
+uint32_t host_alloc(uint32_t size, uint32_t align = 16);
+// fixed 0x100-byte guest buffer number `id` (lazily used features: same address in every session)
+enum FixedSlot : uint32_t { kFixInterpEye = 0, kFixInterpMtx, kFixFxMidPos, kFixLinkScratch, kFixCount };
+inline uint32_t fixed_slot(FixedSlot id) { return kFixedStart + 0x100 * id; }
+uint32_t runtime_top();
+void raise_runtime_top(uint32_t top);
+struct AllocRec { uint32_t addr, size; uint64_t tag; };
+std::vector<AllocRec> runtime_alloc_log();  // sorted by address
+inline uint8_t* ptr(uint32_t ea) { return PPC_MEM_BASE + ea; }
+inline uint32_t guest(const void* p) { return (uint32_t)((const uint8_t*)p - PPC_MEM_BASE); }
+std::string read_cstr(uint32_t ea);
+void write_cstr(uint32_t ea, const std::string& s, uint32_t max);
+}  // namespace mem
+
+// ---- loader ----
+struct LoadedModule {
+    uint32_t entry;
+    uint32_t sda_base;   // r13
+    uint32_t sda2_base;  // r2
+    uint32_t stack_size;
+    uint32_t data_end;   // end of .bss: first free MEM2 address
+};
+bool load_rpx(const std::string& path, LoadedModule& out);
+
+// ---- dispatch ----
+namespace dispatch {
+void init();
+// register a host function callable from guest code; returns its guest address
+uint32_t register_host(PpcFunc fn, const char* name);
+void set(uint32_t addr, PpcFunc fn);
+PpcFunc lookup(uint32_t addr);
+// Private immutable native-text startup seal; no unseal or arbitrary allowlist.
+bool seal_native_text() noexcept;
+bool native_text_sealed() noexcept;
+}  // namespace dispatch
+
+// call a guest function from host code (on the current guest thread)
+uint32_t guest_call(Cpu* c, uint32_t fn, std::initializer_list<uint32_t> args = {});
+
+// ---- threads ----
+// Per-core scheduling: like the hardware, only one guest thread runs on each emulated core at a
+// time, chosen by priority. Code that blocks the host thread (waits, sleeps, I/O) runs inside a
+// BlockingScope so other threads on the core can run meanwhile.
+namespace threads {
+void block_begin();   // give up the core
+void block_end();     // take it back (waits for a turn)
+bool ensure_core();   // service threads entering guest code; true if the core was taken
+void release_core();
+void set_service_core(uint32_t core);
+uint32_t diagnostic_count(); // normal-thread numeric summary, no names/CPU contents
+void report_sched();  // log per-thread core usage
+// diagnostics the settings menu turns on and off while the game runs: the main thread's runtime calls every 5 s
+// (WWHD_MAIN_SAMPLER=1; on the Switch the menu's saved choice) and every game thread's core use every 5 s
+// (WWHD_SCHED_STATS=2; on the Switch in settings.ini's [dev] section)
+void set_main_sampler(bool on);
+bool main_sampler();
+void set_sched_stats(bool on);
+bool sched_stats();
+void dump_state();    // log every guest thread's state and guest call stack, and each core's owner (watchdog)
+}  // namespace threads
+struct BlockingScope {
+    BlockingScope() { threads::block_begin(); }
+    ~BlockingScope() { threads::block_end(); }
+    BlockingScope(const BlockingScope&) = delete;
+};
+
+// host file system calls made for the game so far and their total time (hle/fs.cpp)
+void fs_stats(uint64_t& calls, uint64_t& ns);
+
+namespace threads {
+void init(const LoadedModule& m);
+void run_main(const LoadedModule& m, int argc, uint32_t argv);  // does not return until the game exits
+Cpu* current();          // Cpu of the calling host thread (null if not a guest thread)
+uint32_t current_thread();  // guest OSThread* of the calling thread
+int current_core();         // emulated core of the calling guest thread (-1: not a guest thread)
+// Host-captured creation-declared guest stack bounds for this exact current
+// Cpu. Fails for restored threads lacking a creation receipt, invalid ranges,
+// and an outgoing 0x40-byte frame outside the range. Not allocation ownership.
+bool current_stack_bounds(const Cpu* c, uint32_t& bottom, uint32_t& top);
+// a Cpu + guest stack for host-created threads that need to call guest code (alarms, audio)
+Cpu* make_service_cpu(const char* name, uint32_t stack_size = 0x10000);
+// service threads bracket their guest work (callbacks, guest memory access) with these, so a save
+// state can wait until they are idle; service_begin blocks while the game is frozen
+void service_begin();
+void service_end();
+// a blocking sleep that counts as parked for save states (OSSleepTicks, GX2WaitForVsync)
+void park_sleep_until(std::chrono::steady_clock::time_point t,
+                      bool precise = false, void (*before_resume)() = nullptr);
+
+// ---- save states (savestate.cpp) ----
+// Freeze every other guest thread at a parked point; the caller (the game's main thread, between
+// frames) gives up its core meanwhile. False (and `busy` names the culprits) if they did not all
+// park within the timeout; thaw() must be called either way.
+// entry_mode: threads still running after entry_after_ms park at a guest function entry
+// (1: any such thread, 2: only at the place a loaded snapshot has them)
+bool quiesce(int timeout_ms, std::string& busy, int entry_mode = 0, int entry_after_ms = 0);
+void thaw();
+}  // namespace threads
+
+// ---- time ----
+namespace timebase {
+constexpr uint64_t kTicksPerSec = 62156250ull;  // Espresso bus clock / 4
+uint64_t now();  // host ticks since boot (monotonic; host-side timing)
+// Guest-visible time (OSGetTime, mftb, alarms): the accelerated simulation clock plus
+// a save-state offset, so a restored guest continues from its saved time.
+uint64_t guest_now();
+uint64_t simulation_now(); // host time plus accumulated fast-forward time (before state offset)
+void set_clock_rate(unsigned rate);
+uint64_t to_guest(uint64_t simulation_ticks);
+uint64_t to_host(uint64_t guest_ticks); // simulated host ticks, before the save-state offset
+void set_guest_now(uint64_t guest_ticks);
+}
+
+// ---- HLE registration ----
+struct HleReg {
+    const char* lib;
+    const char* name;
+    PpcFunc fn;
+    HleReg(const char* l, const char* n, PpcFunc f);
+};
+PpcFunc hle_find(const char* lib, const char* name);  // null if not implemented
+PpcFunc hle_find_any(const char* name);
+
+// the runtime function the game's main thread is in (null: guest code), for the main-thread sampler
+// (threads.cpp hle_sampler): where its time goes, waits that keep its emulated core included
+extern std::atomic<const char*> g_main_hle;
+extern std::atomic<bool> g_main_sampler_on;  // WWHD_MAIN_SAMPLER, or the Switch tab (threads::set_main_sampler)
+extern thread_local bool t_is_main_thread;
+// Only the main thread writes g_main_hle, so a plain load and store do (the atomic exchange was
+// 2.6% of the main thread on the desktop), and only while the sampler runs.
+struct HleMark {
+    const char* prev = nullptr;
+    bool on;
+    HleMark(const Cpu* c, const char* name) : on(g_main_sampler_on.load(std::memory_order_relaxed) && c->main_thread) {
+        if (on) {
+            prev = g_main_hle.load(std::memory_order_relaxed);
+            g_main_hle.store(name, std::memory_order_relaxed);
+        }
+    }
+    ~HleMark() {
+        if (on) g_main_hle.store(prev, std::memory_order_relaxed);
+    }
+};
+struct GuestExit { uint32_t value; };
+// (this fork) on the Switch an HLE call runs its body directly, as before the upstream sync: the
+// console's crash report is its own, and the guarded entry (a lambda in a try block) cost ~0.25 ms
+// of the main thread a frame in the lava room (thousands of GX2 calls; docs/perf-test.md)
+#ifdef __SWITCH__
+#define HLE_BODY_CALL(lib, name, c) hle_impl_##lib##_##name(c)
+#else
+#define HLE_BODY_CALL(lib, name, c)                                           \
+        exception_report::boundary<GuestExit>("HLE " #lib "." #name, [&] {      \
+            hle_impl_##lib##_##name(c);                                       \
+        })
+#endif
+#define HLE(lib, name)                                                        \
+    static void hle_impl_##lib##_##name(Cpu* c);                               \
+    extern "C" void imp_##lib##_##name(Cpu* c) {                               \
+        HleMark hle_mark_(c, #name);                                           \
+        HLE_BODY_CALL(lib, name, c);                                           \
+    }                                                                        \
+    static HleReg hle_reg_##lib##_##name(#lib, #name, imp_##lib##_##name);       \
+    static void hle_impl_##lib##_##name(Cpu* c)
+
+// argument helpers (PPC SysV ABI)
+inline uint32_t arg(Cpu* c, int i) { return c->r[3 + i]; }
+inline uint64_t arg64(Cpu* c, int reg) { return ((uint64_t)c->r[reg] << 32) | c->r[reg + 1]; }  // reg = first of pair
+inline void ret(Cpu* c, uint32_t v) { c->r[3] = v; }
+inline void ret64(Cpu* c, uint64_t v) { c->r[3] = (uint32_t)(v >> 32); c->r[4] = (uint32_t)v; }
+
+// ---- logging ----
+extern bool g_trace_hle;
+void log_msg(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+void log_flush();  // writes out buffered log lines (the Switch logs through a writer thread)
+[[noreturn]] void fatal(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+#define LOG(...) log_msg(__VA_ARGS__)
+#ifdef __SWITCH__
+size_t heap_never_used_mib();  // platform/core_switch.cpp
+void log_heap(const char* when);
+#endif
+// every later log line also goes to `sink` (one line without '\n'); nullptr stops (main.cpp: log file)
+void log_set_sink(void (*sink)(const char*, size_t));
+void log_ring_write(int fd, void (*out)(int, const char*, size_t));  // the recent lines, oldest first
+// writes the last ~200 log lines through out(fd, text, len) (used by crash logs; no locking)
+void log_ring_write(int fd, void (*out)(int, const char*, size_t));
+#define TRACE(...) do { if (g_trace_hle) log_msg(__VA_ARGS__); } while (0)
+
+// ---- configuration ----
+namespace config {
+extern std::string game_dir;   // extracted game root (contains code/, content/, meta/)
+extern std::string save_dir;   // host directory for save data
+}

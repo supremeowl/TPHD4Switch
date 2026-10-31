@@ -1,0 +1,81 @@
+# uam in SwitchWakerHD
+
+uam 1.1.0, https://github.com/devkitPro/uam at `5a5afc2` (LICENSE: zlib for uam's own files, MIT for
+mesa-imported/). Built by `CMakeLists.txt` (no meson) as the static library `uamlib`; the renderer uses
+it through `uam_api.h` (init / compile, one thread only). `generated/` holds what meson would produce
+with bison, flex and mako: rerun `tools/generate.sh` (bison, flex, python3-mako; e.g. the `uam-host`
+Docker image) after editing a `.yy`, `.ll`, `.y`, `.l` or `ir_expression_operation.py`.
+
+Every change to upstream files is marked `SwitchWakerHD patch N`.
+
+1. **Real mutexes** (`mesa-imported/c11/threads.h`). Upstream's header is a single-threaded stub; it
+   now maps to pthread mutexes. (Not reentrant with this alone: patch 10.)
+2. **DKSH in memory**: `DekoCompiler::WriteDksh(std::vector<uint8_t>&)` next to `OutputDksh`, same
+   bytes without a file (`source/compiler_iface.*`).
+3. **Log callback** (`source/uam_log.h`, `source/mini-os.c`): the frontend's and the compiler
+   interface's `fprintf(stderr)`, Mesa's `_mesa_warning` / out-of-memory messages, `os_log_message`
+   and nv50_ir's `ERROR()` (a no-op in release builds before) go to `uam_set_log_callback` (stderr
+   when unset). `uam::compile` collects them in `Result::log`.
+4. **No exit()/abort() from CompileGlsl**: the `exit(1)` in `st_glsl_to_tgsi.cpp`, the `abort()` in
+   `lower_mat_op_to_vec.cpp` and `nv50_ir_from_tgsi.cpp`, nv50_ir's `FATAL()` and flex's
+   `YY_FATAL_ERROR` (both lexers) call `uam_fatal()`, which logs and `longjmp`s back to
+   `DekoCompiler::CompileGlsl`; the compile returns false and what it had allocated is leaked.
+   Mesa's `assert`/`unreachable` stay compiled out (`NDEBUG` is always defined for `uamlib`); the
+   `abort()`s in `ir_validate.cpp` exist only in `DEBUG` builds.
+5. **Resident frontend** (`DekoCompiler::SetFrontendResident`, `uam::init(true)`): Mesa's built-in
+   GLSL function library and type tables are built on the first compile and kept, instead of being
+   rebuilt and freed around every `DekoCompiler` as the uam tool does. Same bytes; about 20 % less
+   compile time on the host.
+6. **Deterministic scheduling data** (`mesa-imported/codegen/nv50_ir.cpp`, `Instruction::init`):
+   `sched` starts at 0x7e0. `SchedDataCalculatorGM107::setDelay` reads the wait mask of the next
+   block's first instruction before that block is visited, i.e. uninitialised heap memory (valgrind:
+   "Conditional jump or move depends on uninitialised value(s)" in `setDelay`). Upstream uam's stall
+   counts therefore depend on what the heap held: compiled in one process after other shaders, 89 of
+   the prototype's 1561 Cemu shaders came out different from the uam tool's files, and a fresh run of
+   the prototype's own uam binary no longer reproduces 5 of the reference files it wrote. 0x7e0 (no
+   barrier, nothing to wait on) is what the scheduler gives every instruction before it runs.
+
+7. **No dual issue** (`mesa-imported/codegen/nv50_ir_emit_gm107.cpp`, `SchedDataCalculatorGM107::setDelay`):
+   uam's Maxwell dual-issue scheduling (README: "enhanced with new experimental findings"; Mesa 20.1,
+   which gfx/gl runs on, never dual-issues) made 4x8-pixel blocks (one 32-thread fragment warp) of
+   sunlit surfaces flicker with wrong lighting on Outset and in Dragon Roost Cavern. Bisected on the
+   console (2026-10-07) with the renderer's load-time patch of the scheduling words: as compiled =
+   specks, no dual issue = clean, same fps. Every instruction now gets its normal stall count instead
+   of a zero-delay pair.
+
+8. **Stall 2 before a new block** (`mesa-imported/codegen/nv50_ir_emit_gm107.cpp`,
+   `SchedDataCalculatorGM107::setDelay`; found in SwitchWaker, its patch 8, devkitPro/uam#7): Mesa
+   20.1's rule restored. A dependency barrier becomes active one clock after the instruction that
+   sets it, so Mesa gives an instruction that sets one stall 2 when the next instruction is in another
+   block (whose waits are not known yet). uam asked the next block's entry instead, and that entry's
+   "wait on every barrier" is only added when the block is visited: the last instruction of a block
+   got stall 1 and the next block's first one could pass the barrier before it was active. On
+   SwitchWaker's console (2026-10-08) the light volumes' fragment epilogue `MOV R0, 1.0` overwrote
+   `IPA.SAT R3 = a[0x8c] * R0` (R0 = 1/w) before the IPA read it: flickering 4x8-pixel specks on every
+   torch halo. Not seen here yet (latent: same uam, same pattern possible in any shader whose block
+   ends on a barrier-setting instruction). The DKSH compiler name gains "patch 8", so every cached
+   DKSH is rebuilt.
+
+9. **Free a compile's memory** (`source/glsl_frontend.cpp`, `glsl_program_free`;
+   `source/compiler_iface.cpp`, `~DekoCompiler`): uam freed the program but not its linked shaders
+   (each its own ralloc tree: the linked IR), their programs' parameter lists (malloc, not ralloc) or
+   nv50's binary (`m_info.bin.code`, MALLOC). Freed now as Mesa's `_mesa_delete_linked_shader` and
+   `_mesa_delete_program` do. On the console (2026-10-15 census, first start, ~7,800 compiles) this
+   was ~130 MiB that stayed in use after the preparation. The DKSH bytes do not change (no new
+   compiler name): `uam_dksh_test` on 589 sources, 175 identical to the unpatched tool, the other 414
+   fail in both (GL-renderer sources, driver constbuf uniforms), clean under Guard Malloc; macOS
+   `leaks` at exit: 3.43 MB before, 0.29 MB after.
+
+Check: `uam_dksh_test` (`-DWWHD_UAM_TEST=ON`) compiles a directory of GLSL files in one process and
+compares the DKSH bytes with reference files written by the `uam` tool (target `uam_tool`), one
+process per shader.
+
+10. **Reentrant** (`source/glsl_frontend.cpp`, `source/mini-os.c`, `source/uam_log.h`): the `gl_context` that
+    every compile re-initialises is one per thread (on the heap, made on the thread's first compile), and the log
+    callback and the fatal-error jump are thread-local. With the resident frontend (patch 5, `uam::init(true)`)
+    the shared parts, Mesa's type tables and built-in function library, are built under patch 1's mutexes and
+    only read afterwards, so several threads may compile at once (one `uam::compile` per thread at a time).
+    Checked with `tools/switch/dksh_cache stress` on 24,417 of the game's GLSL sources (macOS, arm64): 3 threads
+    give the same DKSH bytes as one, 2.5x as fast; ThreadSanitizer: 0 reports on 1,000 sources with 3 threads,
+    against 46 reports and an abort without this patch (the shared `gl_context`'s initialisation and the log
+    callback).

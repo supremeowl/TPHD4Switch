@@ -1,0 +1,2436 @@
+// The deko3d renderer's draw path (dk_draw.h): GX2 register state -> deko3d commands. A structural port of
+// gfx/gl/draw.cpp (shader memo and combinations, index conversion, vertex trimming, target and texture caches,
+// GamePad skip, trace) with GL's state calls replaced by deko3d's state structs, and gfx/vulkan/draw.cpp's
+// viewport, scissor and front-face math adapted to deko3d's clip space (y up; see set_viewport).
+//
+// Every draw: shaders (dk_shaders.h; a draw whose shaders are not ready is skipped quietly), indices,
+// render targets, textures and uniform blocks (dk_surfaces.h; resolved before anything is bound), then the
+// bindings and state that differ from what the command buffer already has (StateCache, reset by
+// forget_state), the vertex streams and the draw itself.
+#include "dk_draw.h"
+#include "render_prof.h"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <cstdarg>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <unordered_set>
+#include <vector>
+
+#include "Cafe/HW/Latte/Core/FetchShader.h"
+#include "Cafe/HW/Latte/Core/LatteCachedFBO.h"
+#include "Cafe/HW/Latte/ISA/LatteReg.h"
+#include "Cafe/HW/Latte/ISA/RegDefines.h"
+#include "dk_capture.h"
+#include "dk_shaders.h"
+#include "dk_surfaces.h"
+#include "dk_sync.h"
+#include "gfx/switch_renderer.h"
+#include "runtime.h"
+
+using namespace Latte;
+extern "C" uint64_t g_shader_state_gen;  // gx2_core.cpp: bumped by shader-relevant register changes
+extern "C" uint64_t g_shader_regs_gen;   // the same, except for changes of shader program registers
+
+namespace gfxdk {
+
+bool g_traceFrame = false, g_captureDraws = false;
+
+namespace {
+float f32(uint32_t v) {
+    float f;
+    memcpy(&f, &v, 4);
+    return f;
+}
+// a switch read from WWHD_DK_<name>
+bool env_switch(const char* name, bool fallback) {
+    const std::string dk = std::string("WWHD_DK_") + name;
+    const char* e = getenv(dk.c_str());
+    if (!e || !*e) return fallback;
+    return *e != '0';
+}
+void log_once(uint64_t key, const char* fmt, const std::string& what) {
+    static std::unordered_set<uint64_t> seen;
+    if (seen.insert(key).second) LOG(fmt, what.c_str());
+}
+
+// ---- Latte -> deko3d enums
+DkBlendFactor blend_factor(uint32_t v) {
+    static const DkBlendFactor t[] = {
+        DkBlendFactor_Zero,        DkBlendFactor_One,           DkBlendFactor_SrcColor,      DkBlendFactor_InvSrcColor,
+        DkBlendFactor_SrcAlpha,    DkBlendFactor_InvSrcAlpha,   DkBlendFactor_DstAlpha,      DkBlendFactor_InvDstAlpha,
+        DkBlendFactor_DstColor,    DkBlendFactor_InvDstColor,   DkBlendFactor_SrcAlphaSaturate, DkBlendFactor_SrcAlpha,
+        DkBlendFactor_InvSrcAlpha, DkBlendFactor_ConstColor,    DkBlendFactor_InvConstColor, DkBlendFactor_Src1Color,
+        DkBlendFactor_InvSrc1Color, DkBlendFactor_Src1Alpha,    DkBlendFactor_InvSrc1Alpha,  DkBlendFactor_ConstAlpha,
+        DkBlendFactor_InvConstAlpha};
+    return v < std::size(t) ? t[v] : DkBlendFactor_One;
+}
+bool constant_factor(DkBlendFactor f) {
+    return f == DkBlendFactor_ConstColor || f == DkBlendFactor_InvConstColor || f == DkBlendFactor_ConstAlpha ||
+           f == DkBlendFactor_InvConstAlpha;
+}
+DkBlendOp blend_op(uint32_t v) {
+    static const DkBlendOp t[] = {DkBlendOp_Add, DkBlendOp_Sub, DkBlendOp_Min, DkBlendOp_Max, DkBlendOp_RevSub};
+    return v < 5 ? t[v] : DkBlendOp_Add;
+}
+// Latte's compare functions and stencil operations are in GL's order; deko3d's start at 1
+DkCompareOp compare_op(uint32_t v) { return DkCompareOp((v & 7) + 1); }
+DkStencilOp stencil_op(uint32_t v) { return DkStencilOp((v & 7) + 1); }
+DkLogicOp logic_op(uint32_t rop) {
+    switch (rop) {
+    case 0x00: return DkLogicOp_Clear;
+    case 0x88: return DkLogicOp_And;
+    case 0x44: return DkLogicOp_AndReverse;
+    case 0x22: return DkLogicOp_AndInverted;
+    case 0xAA: return DkLogicOp_NoOp;
+    case 0x66: return DkLogicOp_Xor;
+    case 0xEE: return DkLogicOp_Or;
+    case 0x11: return DkLogicOp_Nor;
+    case 0x99: return DkLogicOp_Equivalent;
+    case 0x55: return DkLogicOp_Invert;
+    case 0xDD: return DkLogicOp_OrReverse;
+    case 0x33: return DkLogicOp_CopyInverted;
+    case 0xBB: return DkLogicOp_OrInverted;
+    case 0x77: return DkLogicOp_Nand;
+    case 0xFF: return DkLogicOp_Set;
+    default: return DkLogicOp_Copy;
+    }
+}
+// raw unsigned fetch of each Latte vertex format (as gfx/gl): the GLSL decodes endianness and type
+bool vertex_format(E_HWFMT f, DkVtxAttribSize& size, uint32_t& bytes) {
+    switch (f) {
+    case E_HWFMT::HWFMT_32_32_32_32_FLOAT: case E_HWFMT::HWFMT_32_32_32_32: size = DkVtxAttribSize_4x32; bytes = 16; break;
+    case E_HWFMT::HWFMT_32_32_32_FLOAT: case E_HWFMT::HWFMT_32_32_32: size = DkVtxAttribSize_3x32; bytes = 12; break;
+    case E_HWFMT::HWFMT_32_32_FLOAT: case E_HWFMT::HWFMT_32_32: size = DkVtxAttribSize_2x32; bytes = 8; break;
+    case E_HWFMT::HWFMT_32_FLOAT: case E_HWFMT::HWFMT_32: case E_HWFMT::HWFMT_2_10_10_10:
+        size = DkVtxAttribSize_1x32; bytes = 4; break;
+    case E_HWFMT::HWFMT_8_8_8_8: size = DkVtxAttribSize_4x8; bytes = 4; break;
+    case E_HWFMT::HWFMT_8_8_8: size = DkVtxAttribSize_3x8; bytes = 3; break;
+    case E_HWFMT::HWFMT_8_8: size = DkVtxAttribSize_2x8; bytes = 2; break;
+    case E_HWFMT::HWFMT_8: size = DkVtxAttribSize_1x8; bytes = 1; break;
+    case E_HWFMT::HWFMT_16_16_16_16: case E_HWFMT::HWFMT_16_16_16_16_FLOAT: size = DkVtxAttribSize_4x16; bytes = 8; break;
+    case E_HWFMT::HWFMT_16_16_16: case E_HWFMT::HWFMT_16_16_16_FLOAT: size = DkVtxAttribSize_3x16; bytes = 6; break;
+    case E_HWFMT::HWFMT_16_16: case E_HWFMT::HWFMT_16_16_FLOAT: size = DkVtxAttribSize_2x16; bytes = 4; break;
+    case E_HWFMT::HWFMT_16: case E_HWFMT::HWFMT_16_FLOAT: size = DkVtxAttribSize_1x16; bytes = 2; break;
+    default: return false;
+    }
+    return true;
+}
+template <class T> T zeroed() {
+    T v;
+    memset(&v, 0, sizeof v);  // deko3d's state structs are bit fields: their unused bits compare equal too
+    return v;
+}
+template <class T> bool same_bytes(const T& a, const T& b) { return !memcmp(&a, &b, sizeof(T)); }
+
+// ---- what the command buffer has bound (draws only issue what changed). Code outside draw() that binds
+// anything calls forget_state() (dk_draw.h): every entry becomes unknown.
+constexpr int kMaxColor = 8, kVtxBuffers = 16, kVtxAttribs = 32;
+struct StateCache {
+    uint64_t epoch = 0;
+    // render targets (also re-bound when a surface got a new image: R.textureEpoch)
+    bool targetsKnown = false;
+    uint64_t targetsTextureEpoch = 0;
+    std::array<Surface*, kMaxColor> colors{};
+    uint32_t slices[kMaxColor]{};
+    bool srgbViews[kMaxColor]{};  // (color_target)
+    Surface* depth = nullptr;
+    uint32_t depthSlice = 0;
+    const DkShader *vs = nullptr, *ps = nullptr;
+    bool rasterKnown = false, depthStencilKnown = false, colorKnown = false, colorWriteKnown = false;
+    DkRasterizerState raster;
+    DkDepthStencilState depthStencil;
+    DkColorState color;
+    DkColorWriteState colorWrite;
+    uint8_t blendKnown = 0;
+    DkBlendState blend[kMaxColor];
+    bool blendConstKnown = false;
+    uint32_t blendConst[4]{};
+    bool stencilKnown = false;
+    uint32_t stencil[2]{};  // DB_STENCILREFMASK, ..._BF as bound
+    bool depthBiasKnown = false;
+    float depthBias[3]{};
+    bool viewportKnown = false;
+    DkViewport viewport;
+    int swizzle = -1;  // 0: identity, 1: y negated
+    bool scissorKnown = false;
+    DkScissor scissor;
+    float pointSize = -1;
+    int restart = -1;  // 0: off, else on with restartIndex
+    uint32_t restartIndex = 0;
+    DkGpuAddr indexAddr = 0;
+    int indexFormat = -1;
+    uint32_t attribCount = ~0u, bufferStateCount = ~0u;
+    DkVtxAttribState attribs[kVtxAttribs];
+    DkVtxBufferState bufferStates[kVtxBuffers];
+    // (WWHD_DK_VTX_IDENTITY) the VertexLayout::build the bound attributes are (0: unknown); the one the buffer states
+    // were made with and its groups' strides
+    uint64_t attribBuild = 0, bufferBuild = 0;
+    uint32_t bufferStrides[kVtxBuffers]{};
+    DkBufExtents vtx[kVtxBuffers];
+    uint32_t vtxKnown = 0;  // bit per vertex buffer
+    DkBufExtents ubo[2][kMaxUniformBuffers];
+    uint32_t uboKnown[2]{};
+    DkResHandle tex[2][kMaxSamplers];
+    uint32_t texKnown[2]{};
+} gs;
+
+void sync_cache() {
+    if (gs.epoch == R.stateEpoch) return;
+    gs = StateCache{};
+    gs.epoch = R.stateEpoch;
+}
+
+// ---- trace switches (as gfx/gl): WWHD_DK_TRACE_DRAWS logs every draw of a traced frame
+const bool g_traceDraws = env_switch("TRACE_DRAWS", false);
+std::string g_traceTextures;  // the textures of the draw being prepared
+std::string g_traceVertices;  // (traced draws) the first two vertices of each vertex stream, guest bytes
+uint32_t g_frameDraws = 0;    // draws executed in the frame being recorded: the trace's and captures' #n
+
+// the draw being prepared: renders the GamePad picture; its targets' internal resolution
+bool g_gamepadDrawing = false;
+float g_drawScale = 1.0f;
+bool g_drawSamplesRendered = false;  // it samples a texture the GPU rendered
+bool g_drawDepthWrites = false;      // it writes its depth buffer (depth writes or a stencil test on)
+bool g_drawSamplesBoundDepth = false;  // it samples its bound depth buffer in place (dk_sync.h)
+// each stage's texture units: texture pixels per guest pixel (programs with uf_texNScale; gfx/gl g_unitScale)
+float g_unitScale[2][LATTE_NUM_MAX_TEX_UNITS][2];
+const bool g_unitScaleInit = [] {
+    for (auto& stage : g_unitScale)
+        for (auto& unit : stage) unit[0] = unit[1] = 1.0f;
+    return true;
+}();
+uint64_t g_zcullSeen = 0;            // R.zcullEpoch when zcull data was last dropped
+
+// ---- per stage: the textures and uniform blocks of a draw, in deko3d slots (resolved before any binding)
+constexpr int kVertexStage = 0, kPixelStage = 1;
+struct StageBindings {
+    DkResHandle tex[kMaxSamplers];
+    uint32_t texMask = 0;
+    DkBufExtents ubo[kMaxUniformBuffers];
+    uint32_t uboMask = 0;
+};
+
+struct TextureCacheEntry {
+    uint64_t epoch = 0;  // R.surfaceEpoch when filled; 0: not reusable
+    uint64_t textureEpoch = 0;
+    // a lookup among several surfaces at one address (chosen by their write order): valid while none of them
+    // was written since (Surface::addrWrites; WWHD_DK_TEX_SHARED_CACHE). Null for an address with one surface.
+    const uint64_t* shared = nullptr;
+    uint64_t sharedSeen = 0;
+    uint32_t words[7], sampler[3];
+    bool compare = false;
+    Surface* s = nullptr;
+    uint32_t view = 0, smp = 0;
+};
+TextureCacheEntry textureCache[2][LATTE_NUM_MAX_TEX_UNITS];  // vertex, pixel
+// P4 resources lane: behind the per-unit entry (the last lookup of the unit), a table of recent lookups by their
+// words: draws that alternate materials on a unit find them there instead of redoing the lookup
+// (find_or_create_surface's multimap, the view and sampler maps)
+constexpr uint32_t kTextureTableSize = 1024;
+TextureCacheEntry textureTable[kTextureTableSize];
+inline TextureCacheEntry& texture_table_entry(const uint32_t* words, const uint32_t* sampler, bool compare) {
+    uint64_t h = compare ? 0x9E3779B97F4A7C15ull : 0xCBF29CE484222325ull;
+    for (int i = 0; i < 7; i++) h = (h ^ words[i]) * 0x100000001B3ull;
+    for (int i = 0; i < 3; i++) h = (h ^ sampler[i]) * 0x100000001B3ull;
+    return textureTable[(h ^ (h >> 29) ^ (h >> 47)) & (kTextureTableSize - 1)];
+}
+inline bool texture_entry_hit(const TextureCacheEntry& e, const uint32_t* words, const uint32_t* sampler, bool compare) {
+    return e.epoch == R.surfaceEpoch && e.textureEpoch == R.textureEpoch && e.compare == compare &&
+           (!e.shared || *e.shared == e.sharedSeen) && !memcmp(e.words, words, sizeof e.words) &&
+           !memcmp(e.sampler, sampler, sizeof e.sampler);
+}
+
+// The ufBlock (P4 resources lane, WWHD_DK_UF_CACHE): 0 = pack_uniforms into a new stream slice every draw (P2's
+// path); 1 = a copy per shader, a new slice only when a value changed; 2 (default) = the copy per shader in one
+// slice per frame, changed pieces pushed into it (dkCmdBufPushConstants), the address unchanged (no rebind)
+const int g_ufMode = [] {
+    const char* e = getenv("WWHD_DK_UF_CACHE");
+    if (!e || !*e) return 2;
+    const int v = atoi(e);
+    return v < 0 || v > 2 ? 2 : v;
+}();
+
+// Round 40 (the 22 fps views of Outset at stock clocks: the render thread at 998 ms/s). Each is on unless its
+// switch is 0 (settings.ini [dev]), and the Switch tab turns it off and on while the game runs (gfxsw::set_draw_opt):
+// - WWHD_DK_DEPTH_ONLY: a draw with a depth buffer and no color target (the shadow maps: half the draws) whose
+//   pixel shader cannot change depth, stencil or memory (Shader::fragmentEffects: no discard, alpha test,
+//   gl_FragDepth or image stores) runs an empty pixel shader; its pixel stage's textures, uniform blocks and
+//   ufBlock are not looked up, packed or bound. The GPU skips the shading too.
+// - WWHD_DK_TEX_SHARED_CACHE: texture lookups at an address that holds several surfaces (render targets sampled
+//   later, such as the shadow maps every lit draw reads) are cached too, while no surface there is written
+//   (Surface::addrWrites); before, each was a full lookup (~0.9 us at 1020 MHz).
+// - WWHD_DK_VTX_LAYOUT_CACHE: the vertex attribute layout (formats, locations, which buffers) is built once per
+//   vertex shader and fetch shader instead of at every draw; only the buffers' addresses, sizes and strides are
+//   read per draw.
+// (the switches are defined after g_fixedSkip, dk_draw.h)
+
+// The resources stage's finer figures (P4 resources lane), per 5 s report (log_resource_stats): times of timed
+// draws (x kDrawTimeSample, as R.perf) and counts of every draw
+struct ResourcePerf {
+    uint64_t targetNs = 0, uboNs = 0, textureNs = 0, textureMissNs = 0, uniformNs = 0, descriptorNs = 0, bindNs = 0;
+    uint64_t textureMisses = 0, tableHits = 0, tableLookups = 0;
+    uint64_t uboBlocks = 0, uboReused = 0;  // guest uniform blocks of draws; ... found already in this frame's stream
+    uint64_t uboMemoHits = 0;               // ... by the stage's memo (uboMemo)
+    uint64_t texBindCalls = 0, texHandles = 0, texWanted = 0;  // dkCmdBufBindTextures calls, handles; slots draws use
+    uint64_t uboBindCalls = 0, uboBuffers = 0, uboWanted = 0;  // dkCmdBufBindUniformBuffers calls, buffers; slots
+    // the state stage in parts: ordering, targets, shaders, binds, viewport and scissor; rasterizer, depth /
+    // stencil and color output (fixed); vertex streams. fixedSkips: draws whose fixed part was the last one's
+    uint64_t stateBindNs = 0, stateFixedNs = 0, stateVertexNs = 0, fixedSkips = 0;
+    // round 40: depth-only draws without their pixel shader; texture lookups at shared addresses and the hits
+    // among them; vertex layouts built (the rest came from the vertex shader's cache)
+    uint64_t depthOnlyDraws = 0, sharedLookups = 0, sharedHits = 0, layoutBuilds = 0;
+    // round 41: depth-only draws that kept their pixel shader, by what its GLSL does (Shader::fragmentWhy)
+    uint64_t keptAlphaTest = 0, keptDiscard = 0, keptDepthOrMemory = 0;
+    uint64_t targetMemoHits = 0;  // draws whose render targets came from the last draw's lookup (WWHD_DK_REG_GENS)
+    // the draw-memo round: draws among them that skipped the targets' scale and upload checks (WWHD_DK_TARGET_MEMO2);
+    // draws whose rasterizer, depth/stencil and color output were the last ones' (WWHD_DK_FIXED_MEMO); vertex
+    // attribute and buffer states found bound by layout identity (WWHD_DK_VTX_IDENTITY)
+    uint64_t targetChecksSkipped = 0, fixedRasterHits = 0, fixedDepthHits = 0, fixedColorHits = 0;
+    uint64_t attribSame = 0, bufferStateSame = 0;
+} g_res;
+
+// the draw's stage timer: lap() adds the time since the last mark to a stage total; sub() to one part of the
+// resources stage (and to the stage's total, R.perf.resourceNs)
+struct Lap {
+    bool on;
+    uint64_t at;
+    void operator()(uint64_t& total) {
+        if (!on) return;
+        const uint64_t now = now_ns();
+        total += (now - at) * kDrawTimeSample;
+        at = now;
+    }
+    void sub(uint64_t& part) {
+        if (!on) return;
+        const uint64_t now = now_ns(), d = (now - at) * kDrawTimeSample;
+        part += d;
+        R.perf.resourceNs += d;
+        at = now;
+    }
+};
+
+// a zero-filled uniform block for a GX2 block with no address, once per frame
+StreamSlice zero_block() {
+    static StreamSlice slice;
+    static uint64_t frame = ~0ull;
+    if (frame != R.frame || !slice) {
+        static const std::vector<uint8_t> zeros(0x10000, 0);
+        slice = stream_upload(zeros.data(), uint32_t(zeros.size()), DK_UNIFORM_BUF_ALIGNMENT);
+        frame = R.frame;
+    }
+    return slice;
+}
+
+// Ambient-occlusion quirks, as gfx/gl draw.cpp (and the Metal and Vulkan renderers): WWHD_AO_MODE=0..2
+// chooses one. The game downsamples the scene depth to 640x360 and computes ambient
+// occlusion from it at 960x540 (vertex shader 44BDF900, pixel shader 44BDFD00), then blurs it into the shadow mask:
+//   0 = as the hardware renders it: the occlusion pass point-samples its centre depth, and every third row and
+//       column lands half a texel off (screen-fixed lines, and with the noise below grainy bands, on sloped
+//       ground in shadow)
+//   1 = that one fetch is bilinear, like the pass's neighbour fetches: the lines go
+//   2 = (default) 1, and the 4x4 noise texture is tiled per 960x540 pixel instead of per 640x360 pixel, so the
+//       game's blur averages it out (pack_uniforms aoNoise)
+const int g_aoMode = [] {
+    if (const char* e = getenv("WWHD_AO_MODE")) return ((atoi(e) % 3) + 3) % 3;
+    return 2;
+}();
+// The occlusion pass's program in this stage: by its contents (size and hash of the guest program; gfx/gl's
+// values), wherever the game loaded it (its heap address differs between the USA and European builds).
+constexpr uint32_t kOcclusionSize[2] = {1584, 384};  // pixel, vertex (Outset, US v0)
+constexpr uint64_t kOcclusionHash[2] = {0x26870ca3f2e34dfaull, 0x36e37317f62658e9ull};
+bool is_occlusion(const uint32_t* r, bool vertex) {
+    const uint32_t reg = vertex ? mmSQ_PGM_START_VS : mmSQ_PGM_START_PS;
+    const uint32_t addr = r[reg] << 8, size = r[reg + 1] << 3;
+    if (size != kOcclusionSize[vertex]) return false;
+    const uint64_t frame = R.frame + 1;  // the frame being recorded
+    static uint64_t checked[2] = {~0ull, ~0ull};
+    static uint32_t addrSeen[2] = {};
+    static bool result[2] = {};
+    if (checked[vertex] == frame && addrSeen[vertex] == addr) return result[vertex];
+    const uint64_t h = program_hash_of(program_hash_ref(addr, size), addr, size, frame);
+    const bool match = size == kOcclusionSize[vertex] && h == kOcclusionHash[vertex];
+    static uint32_t logged[2] = {};  // (other programs of that size come and go every frame: only new matches)
+    if (match && logged[vertex] != addr) {
+        LOG("[dk] %s program at %08X (size %u, hash %016llx): the occlusion pass, AO fix applied",
+            vertex ? "vertex" : "pixel", addr, size, (unsigned long long)h);
+        logged[vertex] = addr;
+    }
+    checked[vertex] = frame;
+    addrSeen[vertex] = addr;
+    result[vertex] = match;
+    return match;
+}
+
+// Each stage's guest uniform blocks as the last draw found them in the stream:
+// a block at the same address and size is the same slice while the frame and R.streamGen are (stream_guest's
+// own rule), without stream_guest's table probe (P4 resources lane)
+struct UboMemo {
+    uint32_t addr = 0, copy = 0, bound = 0;
+    uint64_t frame = ~0ull, gen = 0;
+    StreamSlice slice;
+};
+UboMemo uboMemo[2][LATTE_NUM_MAX_UNIFORM_BUFFERS];
+
+// false: the stream slice is full (the draw is skipped)
+bool prepare_stage(const uint32_t* r, Shader* sh, const std::array<Surface*, 8>& colors, Surface* depth,
+                   StageBindings& out, Lap& lap) {
+    const int stage = sh->vertex ? kVertexStage : kPixelStage;
+    out.texMask = out.uboMask = 0;
+    // ---- uniform blocks: the guest's bytes, then zeros up to a 256-byte multiple (as gfx/gl: shaders must
+    // read zeros past the guest's data, and the hardware rounds a constant buffer's bound size up to 256
+    // bytes, so unpadded it would read the next upload's data). Reads past the bound range return zero.
+    const uint32_t block = sh->vertex ? mmSQ_VTX_UNIFORM_BLOCK_START : mmSQ_PS_UNIFORM_BLOCK_START;
+    for (int k = 0; k < sh->uboCount; k++) {  // (the blocks with a slot, dk_shaders.h)
+        const int i = sh->uboList[k];
+        const int slot = sh->uboSlot[i];
+        const uint32_t addr = r[block + i * 7], size = std::min<uint32_t>(r[block + i * 7 + 1] + 1, 0x10000);
+        const uint32_t want = sh->uboBytes[i] ? std::min<uint32_t>(sh->uboBytes[i], size) : size;
+        const uint32_t bound = std::min<uint32_t>((want + 255) & ~255u, 0x10000);
+        StreamSlice slice;
+        g_res.uboBlocks++;
+        if (!addr) slice = zero_block();
+        else {
+            const uint32_t copy = std::min(size, bound);
+            UboMemo& m = uboMemo[stage][i];
+            const uint64_t frame = R.frame + 1;
+            if (m.addr == addr && m.copy == copy && m.bound == bound && m.frame == frame &&
+                m.gen == R.streamGen && m.slice) {
+                slice = m.slice;
+                R.perf.reusedBytes += copy;
+                g_res.uboReused++;
+                g_res.uboMemoHits++;
+            } else {
+                const uint64_t reused = R.perf.reusedBytes;
+                rprof::UploadKind kind(rprof::kUpUbo);
+                slice = stream_guest(addr, copy, DK_UNIFORM_BUF_ALIGNMENT, bound - copy);
+                g_res.uboReused += R.perf.reusedBytes != reused;
+                m = {addr, copy, bound, frame, R.streamGen, slice};
+            }
+        }
+        if (!slice) return false;
+        R.perf.uboBytes += bound;
+        out.ubo[slot] = {slice.gpu, bound};
+        out.uboMask |= 1u << slot;
+    }
+    lap.sub(g_res.uboNs);
+    // ---- textures
+    const uint32_t texbase = sh->vertex ? REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS : REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS;
+    for (int i = 0; i < sh->texCount; i++) {  // (the hot copies of the decompiler's lists, dk_shaders.h)
+        const uint32_t unit = sh->texUnit[i];
+        const int slot = sh->textureSlot[unit];
+        const uint32_t samplerIndex = sh->texSampler[unit];
+        if (slot < 0 || slot >= kMaxSamplers || samplerIndex >= 18) continue;
+        const uint32_t* words = r + texbase + unit * 7;
+        const uint32_t* samplerWords = r + REGADDR::SQ_TEX_SAMPLER_WORD0_0 + ((sh->vertex ? 18 : 0) + samplerIndex) * 3;
+        uint32_t aoSampler[3];
+        if (g_aoMode >= 1 && unit == 0 && !sh->vertex && is_occlusion(r, false)) {
+            // AO quirk 1: the occlusion pass's centre depth fetch, bilinear (XY mag/min filter)
+            memcpy(aoSampler, samplerWords, sizeof aoSampler);
+            aoSampler[0] = (aoSampler[0] & ~0x7E00u) | (1u << 9) | (1u << 12);
+            samplerWords = aoSampler;
+        }
+        const bool compare = (sh->texCompare >> unit) & 1;
+        // the last lookup for this unit, reused while its words and the surface set are unchanged
+        TextureCacheEntry& cached = textureCache[stage][unit];
+        R.perf.textureLookups++;
+        Surface* s;
+        uint32_t view, smp;
+        TextureCacheEntry* found = nullptr;
+        if (texture_entry_hit(cached, words, samplerWords, compare)) found = &cached;
+        else {
+            g_res.tableLookups++;
+            TextureCacheEntry& t = texture_table_entry(words, samplerWords, compare);
+            if (texture_entry_hit(t, words, samplerWords, compare)) {
+                g_res.tableHits++;
+                cached = t;  // the unit's entry for the next draw
+                found = &t;
+            }
+        }
+        if (found) {
+            R.perf.textureCacheHits++;
+            if (found->shared) g_res.sharedHits++;
+            s = found->s;
+            // once per frame: CPU changes to the texture (upload_surface's own early outs, without the call)
+            if (s->img.valid && !s->gpuWritten && s->lastCheckedFrame != R.frame) upload_surface(s);
+            view = found->view;
+            smp = found->smp;
+            sampler_used(smp);  // (the sampler cache must not rewrite it while this frame may use it)
+        } else {
+            g_res.textureMisses++;
+            const uint64_t missStart = lap.on ? now_ns() : 0;
+            bool unique = false;
+            s = sampled_texture(words, compare, &unique);
+            if (!s) {  // nothing there: transparent black
+                out.tex[slot] = dkMakeTextureHandle(null_image_id(), sampler_id(samplerWords, compare, false));
+                out.texMask |= 1u << slot;
+                cached.epoch = 0;
+                if (lap.on) g_res.textureMissNs += (now_ns() - missStart) * kDrawTimeSample;
+                continue;
+            }
+            view = sampled_view_id(s, words);
+            smp = sampler_id(samplerWords, compare, s->fmt.kind != FormatInfo::FLOAT);
+            // several surfaces at one address: chosen by their write order, so kept while none is written
+            // (WWHD_DK_TEX_SHARED_CACHE); before, never kept
+            const bool shared = !unique && s->addrWrites && g_texSharedCache.load(std::memory_order_relaxed);
+            if (!unique) g_res.sharedLookups++;
+            cached.epoch = unique || shared ? R.surfaceEpoch : 0;
+            cached.shared = shared ? s->addrWrites : nullptr;
+            cached.sharedSeen = shared ? *s->addrWrites : 0;
+            cached.textureEpoch = R.textureEpoch;
+            memcpy(cached.words, words, sizeof cached.words);
+            memcpy(cached.sampler, samplerWords, sizeof cached.sampler);
+            cached.compare = compare;
+            cached.s = s;
+            cached.view = view;
+            cached.smp = smp;
+            if (cached.epoch) texture_table_entry(words, samplerWords, compare) = cached;
+            if (lap.on) g_res.textureMissNs += (now_ns() - missStart) * kDrawTimeSample;
+        }
+        s->useFrame = R.frame + 1;  // (texture eviction: in use)
+        if (g_gamepadDrawing) {  // a texture of the GamePad picture
+            if (!s->gamepadSource) s->gamepadSourceSince = R.frame;
+            s->gamepadSource = true;
+        } else if (s->drcScanFrame != ~0ull && gamepad_only(s)) {
+            // the GamePad picture itself read by another draw (gfx/gl draw.cpp): it counts as a read once
+            // something else reads what this draw renders
+            for (auto* c : colors)
+                if (c && c != s) c->derivedFrom = s;
+        } else
+            note_read(s);
+        if (g_traceFrame) {
+            trace_draw(s);
+            if (g_traceDraws || g_captureDraws) {
+                char t[160];
+                snprintf(t, sizeof t, " %s%u=%s(smp %08X %08X %08X%s)", sh->vertex ? "vt" : "t", unit,
+                         trace_name(s).c_str(), samplerWords[0], samplerWords[1], samplerWords[2], compare ? " cmp" : "");
+                g_traceTextures += t;
+            }
+        }
+        bool aliases = false;
+        for (auto* c : colors)
+            if (c && c == s) aliases = true;
+        // the bound depth buffer, sampled by a draw that does not write it (a depth test reads it too): read in
+        // place after the barrier the earlier draws' writes need (sync_draw_check), as a Vulkan read-only
+        // depth attachment (WWHD_DK_DEPTH_SAMPLE_BOUND); else a snapshot as for a color target
+        if (depth && s == depth && !aliases) {
+            if (sync_depth_sample_bound() && !g_drawDepthWrites) {
+                g_drawSamplesBoundDepth = true;
+                sync_note_bound_depth_sample();
+            } else
+                aliases = true;
+        }
+        if (g_capture) capture_note_texture(s, sh->vertex, unit, words, samplerWords, compare, aliases);
+        if (aliases) {  // sampling a bound render target is undefined: a snapshot
+            s = feedback_copy(s);
+            view = sampled_view_id(s, words);
+            smp = sampler_id(samplerWords, compare, s->fmt.kind != FormatInfo::FLOAT);
+        }
+        if (s->gpuWritten && (words[0] & 7) == uint32_t(Latte::E_DIM::DIM_3D)) {  // (volume_source's own test first)
+            if (Surface* v = volume_source(s, words); v != s) {  // the layers of a 3D color buffer, sampled as 3D
+                s = v;
+                view = sampled_view_id(s, words);
+            }
+        }
+        if (s->gpuWritten && s->mips == 1 && !compare && (words[0] & 7) == uint32_t(Latte::E_DIM::DIM_2D) && (words[5] & 0xF) != 0) {
+            if (Surface* m = mip_chain(s, words, samplerWords, colors.data(), colors.size()); m != s) {  // levels the render target has not: its mip chain
+                s = m;
+                view = sampled_view_id(s, words);
+            }
+        }
+        sync_draw_sample(s);
+        if (s->gpuWritten) g_drawSamplesRendered = true;
+        if (sh->scaleUniforms) {
+            g_unitScale[stage][unit][0] = float(s->img.pw) / float(s->width);
+            g_unitScale[stage][unit][1] = float(s->img.ph) / float(s->height);
+        }
+        out.tex[slot] = dkMakeTextureHandle(view, smp);
+        out.texMask |= 1u << slot;
+    }
+    lap.sub(g_res.textureNs);
+    return true;
+}
+
+// binds the slots of mask whose value differs from the cache, in runs of consecutive slots
+template <class T, class Bind>
+void bind_runs(const T* want, uint32_t mask, T* cached, uint32_t& known, Bind&& bind) {
+    uint32_t dirty = 0;
+    for (uint32_t m = mask; m; m &= m - 1) {
+        const uint32_t i = __builtin_ctz(m);
+        if ((known & (1u << i)) && same_bytes(cached[i], want[i])) continue;
+        cached[i] = want[i];
+        dirty |= 1u << i;
+    }
+    known |= dirty;
+    while (dirty) {
+        const uint32_t first = __builtin_ctz(dirty);
+        uint32_t n = 0;
+        while (first + n < 32 && (dirty & (1u << (first + n)))) n++;
+        bind(first, &want[first], n);
+        dirty &= n >= 32 ? 0 : ~(((1u << n) - 1) << first);
+    }
+}
+
+void bind_stage(int stage, const StageBindings& b) {
+    const DkStage dkStage = stage == kVertexStage ? DkStage_Vertex : DkStage_Fragment;
+    g_res.uboWanted += __builtin_popcount(b.uboMask);
+    g_res.texWanted += __builtin_popcount(b.texMask);
+    bind_runs(b.ubo, b.uboMask, gs.ubo[stage], gs.uboKnown[stage], [&](uint32_t first, const DkBufExtents* e, uint32_t n) {
+        dkCmdBufBindUniformBuffers(R.cmd, dkStage, first, e, n);
+        g_res.uboBindCalls++;
+        g_res.uboBuffers += n;
+    });
+    bind_runs(b.tex, b.texMask, gs.tex[stage], gs.texKnown[stage], [&](uint32_t first, const DkResHandle* h, uint32_t n) {
+        dkCmdBufBindTextures(R.cmd, dkStage, first, h, n);
+        g_res.texBindCalls++;
+        g_res.texHandles += n;
+    });
+}
+
+// ---- indices: guest index formats and the primitives converted on the CPU (fans, quads, quad strips,
+// line loops, as gfx/gl; P4 may use deko3d's native ones) become host-order index lists, 16-bit when the
+// values fit. Converted lists are reused within a frame until guest buffers may have changed (R.streamGen).
+template <int Type> inline uint32_t read_index(const uint8_t* p, uint32_t i) {
+    if constexpr (Type == 0) { uint16_t v; memcpy(&v, p + i * 2, 2); return v; }
+    else if constexpr (Type == 1) { uint32_t v; memcpy(&v, p + i * 4, 4); return v; }
+    else if constexpr (Type == 4) { uint16_t v; memcpy(&v, p + i * 2, 2); return __builtin_bswap16(v); }
+    else if constexpr (Type == 9) { uint32_t v; memcpy(&v, p + i * 4, 4); return __builtin_bswap32(v); }
+    else return i;  // not indexed
+}
+
+struct IndexList {
+    StreamSlice slice;
+    uint32_t count = 0;
+    int format = -1;  // DkIdxFormat; -1: no index list (dkCmdBufDraw)
+    uint32_t minIndex = 0, maxIndex = 0;  // the vertices the list reads (restart index excluded)
+};
+
+template <int Type, class Out>
+void build_indices(const uint8_t* src, uint32_t count, uint32_t prim, bool restart, uint32_t restartIndex,
+                   std::vector<Out>& out, uint32_t& minIndex, uint32_t& maxIndex) {
+    constexpr Out kRestart = Out(~Out(0));
+    uint32_t m = 0, lo = ~0u;
+    auto get = [&](uint32_t i) -> Out {
+        uint32_t v = read_index<Type>(src, i);
+        if (restart && v == restartIndex) return kRestart;
+        m = std::max(m, v);
+        lo = std::min(lo, v);
+        return Out(v);
+    };
+    switch (prim) {
+    case 5:  // triangle fan
+        out.resize(count > 2 ? size_t(count - 2) * 3 : 0);
+        for (uint32_t i = 1, o = 0; i + 1 < count; i++, o += 3) {
+            out[o] = get(0);
+            out[o + 1] = get(i);
+            out[o + 2] = get(i + 1);
+        }
+        break;
+    case 0x13:  // quad list
+        out.resize(size_t(count / 4) * 6);
+        for (uint32_t i = 0, o = 0; i + 3 < count; i += 4, o += 6) {
+            Out a = get(i), b = get(i + 1), c = get(i + 2), d = get(i + 3);
+            out[o] = a; out[o + 1] = b; out[o + 2] = c; out[o + 3] = a; out[o + 4] = c; out[o + 5] = d;
+        }
+        break;
+    case 0x14:  // quad strip
+        out.resize(count >= 4 ? size_t((count - 2) / 2) * 6 : 0);
+        for (uint32_t i = 0, o = 0; i + 3 < count; i += 2, o += 6) {
+            Out a = get(i), b = get(i + 1), c = get(i + 2), d = get(i + 3);
+            out[o] = a; out[o + 1] = b; out[o + 2] = c; out[o + 3] = b; out[o + 4] = d; out[o + 5] = c;
+        }
+        break;
+    case 0x12:  // line loop
+        out.resize(size_t(count) + 1);
+        for (uint32_t i = 0; i < count; i++) out[i] = get(i);
+        out[count] = get(0);
+        break;
+    default:
+        out.resize(count);
+        if (!restart) {
+            for (uint32_t i = 0; i < count; i++) {
+                uint32_t v = read_index<Type>(src, i);
+                m = std::max(m, v);
+                lo = std::min(lo, v);
+                out[i] = Out(v);
+            }
+        } else
+            for (uint32_t i = 0; i < count; i++) out[i] = get(i);
+        break;
+    }
+    maxIndex = m;
+    minIndex = lo == ~0u ? 0 : std::min(lo, m);
+}
+
+template <int Type> IndexList convert_typed(const uint8_t* src, uint32_t count, uint32_t prim, bool restart, uint32_t restartIndex) {
+    IndexList list;
+    // 16-bit output keeps the guest's 16-bit lists (and short generated lists) at half the bytes; primitive
+    // restart then uses 0xFFFF, so a different restart index needs 32-bit output
+    constexpr bool source16 = Type == 0 || Type == 4;
+    const bool narrow = (Type < 0 ? count < 0xFFFF : source16 && (!restart || restartIndex == 0xFFFF));
+    if (narrow) {
+        static std::vector<uint16_t> out;
+        build_indices<Type>(src, count, prim, restart, restartIndex, out, list.minIndex, list.maxIndex);
+        list.count = uint32_t(out.size());
+        list.format = DkIdxFormat_Uint16;
+        if (out.empty()) return list;  // nothing to draw (no upload)
+        rprof::UploadKind kind(rprof::kUpIndex);
+        list.slice = stream_upload(out.data(), uint32_t(out.size() * 2), 4);
+        R.perf.indexBytes += out.size() * 2;
+    } else {
+        static std::vector<uint32_t> out;
+        build_indices<Type>(src, count, prim, restart, restartIndex, out, list.minIndex, list.maxIndex);
+        list.count = uint32_t(out.size());
+        list.format = DkIdxFormat_Uint32;
+        if (out.empty()) return list;
+        rprof::UploadKind kind(rprof::kUpIndex);
+        list.slice = stream_upload(out.data(), uint32_t(out.size() * 4), 4);
+        R.perf.indexBytes += out.size() * 4;
+    }
+    return list;
+}
+
+// ---- P4 counters of the lookup and index stages (log_lookup_stats, every 5 s from backend.cpp)
+struct LookupStats {
+    // shader lookup: memo misses by cause, state rehashes, combinations validated in a new frame, full lookups
+    uint64_t memoMisses = 0, missFrame = 0, missPrograms = 0, missRegisters = 0, missPrimitive = 0;
+    uint64_t stateHashes = 0, stateHashNs = 0;  // (times: sampled draws, scaled as the per-draw timers)
+    uint64_t validations = 0, validateNs = 0, comboMisses = 0;
+    // indices: draws that needed an index list, cache hits, conversions (indices read), conversion time
+    uint64_t indexLists = 0, indexHits = 0, conversions = 0, convertedIndices = 0, convertNs = 0;
+    uint64_t indexGenBumps = 0, streamGenBumps = 0, invalidatesAttrib = 0, invalidatesUniform = 0;
+    // primitives drawn natively (fans, quads, quad strips, line loops) and converted on the CPU
+    uint64_t nativeFans = 0, nativeQuads = 0, nativeQuadStrips = 0, nativeLineLoops = 0, convertedPrims = 0,
+             flatKeptConverted = 0;
+} g_lookup;
+
+// Index lists are reused within a frame while their guest bytes cannot have changed: only GX2Invalidate of
+// attribute buffers (index buffers are those; GX2 flag 1) and GX2DrawDone make them stale (not R.streamGen,
+// which also advances at every invalidate of uniform blocks, flag 4).
+uint64_t g_indexGen = 1;
+
+IndexList index_list(uint32_t prim, uint32_t count, uint32_t indexType, uint32_t indexAddr, bool restart, uint32_t restartIndex) {
+    struct Entry {
+        uint64_t key = 0, stamp = ~0ull, gen = 0;
+        uint32_t addr = 0, count = 0, type = 0, prim = 0, restartIndex = 0;
+        bool restart = false;
+        IndexList list;
+    };
+    static FrameTable<Entry> cache;
+    const uint64_t stamp = R.frame + 1;  // the frame being recorded (its stream slice)
+    const uint64_t key = (uint64_t(indexAddr) << 32 | count) ^ (uint64_t(prim) << 56 | uint64_t(indexType) << 48) ^
+                         (restart ? 0x5bd1e995ull * (restartIndex + 1) : 0);
+    const uint64_t gen = g_indexGen;
+    g_lookup.indexLists++;
+    if (const Entry* e = cache.find(key, stamp); e->stamp == stamp) {
+        if (e->gen == gen && e->addr == indexAddr && e->count == count && e->type == indexType && e->prim == prim &&
+            e->restart == restart && e->restartIndex == restartIndex) {
+            g_lookup.indexHits++;
+            return e->list;
+        }
+    }
+    g_lookup.conversions++;
+    g_lookup.convertedIndices += count;
+    SampledTime convertTimer{g_lookup.convertNs, R.timedDraw};
+    const uint8_t* src = indexAddr ? mem::ptr(indexAddr) : nullptr;
+    IndexList list;
+    switch (indexAddr ? indexType : ~0u) {
+    case 0: list = convert_typed<0>(src, count, prim, restart, restartIndex); break;
+    case 1: list = convert_typed<1>(src, count, prim, restart, restartIndex); break;
+    case 4: list = convert_typed<4>(src, count, prim, restart, restartIndex); break;
+    case 9: list = convert_typed<9>(src, count, prim, restart, restartIndex); break;
+    default: list = convert_typed<-1>(src, count, prim, false, 0); break;
+    }
+    if (list.slice) cache.put({key, stamp, gen, indexAddr, count, indexType, prim, restartIndex, restart, list});
+    return list;
+}
+
+// The vertex flat (non-interpolated) varyings take: gfx/gl's convention, the last vertex of each primitive.
+// WWHD_DK_PROVOKING_VERTEX=latte follows Latte's PA_SU_SC_MODE_CNTL.PROVOKING_VTX_LAST (bit 19; first when
+// clear, as gfx/vulkan) and =first always takes the first (test aids).
+enum ProvokingMode { kProvokingLast, kProvokingFirst, kProvokingLatte };
+ProvokingMode provoking_mode() {
+    static const ProvokingMode mode = [] {
+        const char* e = getenv("WWHD_DK_PROVOKING_VERTEX");
+        return !e || !*e ? kProvokingLast : !strcmp(e, "latte") ? kProvokingLatte : !strcmp(e, "first") ? kProvokingFirst
+                                                                                                     : kProvokingLast;
+    }();
+    return mode;
+}
+DkProvokingVertex provoking_vertex(const uint32_t* r) {
+    switch (provoking_mode()) {
+    case kProvokingFirst: return DkProvokingVertex_First;
+    case kProvokingLatte:
+        return (r[REGADDR::PA_SU_SC_MODE_CNTL] >> 19) & 1 ? DkProvokingVertex_Last : DkProvokingVertex_First;
+    default: return DkProvokingVertex_Last;
+    }
+}
+
+// the previous draw's shader lookup, reused while no shader-relevant register changed
+struct ShaderMemo {
+    uint64_t gen = 0, frame = ~0ull, epoch = 0;
+    uint32_t prim = ~0u;  // the primitive key (prim_key)
+    LatteFetchShader* fs = nullptr;
+    Shader *vs = nullptr, *ps = nullptr;
+    uint64_t regsGen = 0;  // (the miss counters: programs or other registers changed)
+} memo;
+
+// P4 lookup: WWHD_DK_MEMO_PRIM_CLASS (=0 restores the P3 path): the shader translation reads the primitive type only to know whether it draws
+// points (LatteDecompilerAnalyzer isPointsPrimitive: gl_PointSize output) and, for geometry shaders (which
+// deko3d does not run), the input primitive; the memo and the combinations key on that class instead of the
+// type, so a strip after a list with the same programs and state reuses the lookup without rehashing.
+const bool g_primClass = env_switch("MEMO_PRIM_CLASS", true);
+// A combination's state key is one hash of both stages' registers (shader_combo_state_hash: each shared word
+// once, texture units two to a word); the per-stage core hashes translate needs are made only when the
+// combination is not found (P3: two state hashes and two texture hash chains at every change). A combination
+// made in an earlier frame checks its fetch shader through the program-hash entry it keeps (no hash-map
+// lookups) instead of a full get_fetch_shader.
+uint32_t prim_key(const uint32_t* r, uint32_t prim) {
+    if (!g_primClass || (r[REGADDR::VGT_GS_MODE] & 3)) return prim;
+    return prim == 1 ? 1u : 4u;  // points, or any other primitive
+}
+
+}  // namespace
+DrawSkips g_drawSkips;
+std::atomic<bool> g_fixedSkip{env_switch("FIXED_SKIP", true)};
+std::atomic<bool> g_depthOnly{env_switch("DEPTH_ONLY", true)};
+std::atomic<bool> g_texSharedCache{env_switch("TEX_SHARED_CACHE", true)};
+std::atomic<bool> g_vtxLayoutCache{env_switch("VTX_LAYOUT_CACHE", true)};
+std::atomic<bool> g_regGens{env_switch("REG_GENS", true)};
+std::atomic<bool> g_targetMemo2{env_switch("TARGET_MEMO2", true)};
+// (fixed-state memos and vertex identity: off by default, no measurable gain at Outset, 2026-10-22: +0.03 / +0.09 fps)
+std::atomic<bool> g_fixedMemo{env_switch("FIXED_MEMO", false)};
+std::atomic<bool> g_vtxIdentity{env_switch("VTX_IDENTITY", false)};
+std::atomic<bool> g_prefetch{env_switch("PREFETCH", true)};
+std::atomic<uint32_t> g_submitDraws{[] {
+    const char* e = getenv("WWHD_DK_SUBMIT_DRAWS");
+    return e && *e ? uint32_t(strtoul(e, nullptr, 10)) : kDefaultSubmitDraws;
+}()};
+namespace {
+// a skipped draw's reason, counted for the stats (R.skippedDraws counts them all)
+void skip(uint64_t& reason) {
+    reason++;
+    R.skippedDraws++;
+}
+}  // namespace
+
+int ao_mode() { return g_aoMode; }
+
+void note_invalidate(uint32_t flags) {
+    if (flags & 1) {
+        g_lookup.invalidatesAttrib++;
+        g_indexGen++;
+        g_lookup.indexGenBumps++;
+    }
+    if (flags & 4) g_lookup.invalidatesUniform++;
+    if (flags & 5) g_lookup.streamGenBumps++;
+}
+void note_wait_idle() {
+    g_indexGen++;
+    g_lookup.indexGenBumps++;
+    g_lookup.streamGenBumps++;
+}
+
+void log_lookup_stats(uint64_t frames) {
+    const LookupStats l = g_lookup;
+    g_lookup = {};
+    auto perFrame = [&](uint64_t n) { return frames ? double(n) / double(frames) : 0.0; };
+    auto usEach = [](uint64_t ns, uint64_t n) { return n ? double(ns) / 1e3 / double(n) : 0.0; };
+    LOG("[dk] lookup per frame: memo misses %.0f (new frame %.0f, programs %.0f, other registers %.0f, primitive "
+        "%.0f), state hashes %.0f (%.2f us each), combinations validated %.0f (%.2f us each), full lookups %.1f; "
+        "indices: lists %.0f, hits %.0f%%, conversions %.0f (%.0f indices, %.2f us each), index gen bumps %.1f, "
+        "stream gen bumps %.1f (invalidates: attributes %.1f, uniforms %.1f); primitives: native fans %.1f, quads "
+        "%.1f, quad strips %.1f, line loops %.1f, converted %.1f (%.1f for flat varyings)",
+        perFrame(l.memoMisses), perFrame(l.missFrame), perFrame(l.missPrograms), perFrame(l.missRegisters),
+        perFrame(l.missPrimitive), perFrame(l.stateHashes), usEach(l.stateHashNs, l.stateHashes),
+        perFrame(l.validations), usEach(l.validateNs, l.validations), perFrame(l.comboMisses), perFrame(l.indexLists),
+        l.indexLists ? 100.0 * double(l.indexHits) / double(l.indexLists) : 0.0, perFrame(l.conversions),
+        perFrame(l.convertedIndices), usEach(l.convertNs, l.conversions), perFrame(l.indexGenBumps),
+        perFrame(l.streamGenBumps), perFrame(l.invalidatesAttrib), perFrame(l.invalidatesUniform),
+        perFrame(l.nativeFans), perFrame(l.nativeQuads), perFrame(l.nativeQuadStrips), perFrame(l.nativeLineLoops),
+        perFrame(l.convertedPrims), perFrame(l.flatKeptConverted));
+}
+
+DrawSkips draw_skips_take() {
+    const DrawSkips s = g_drawSkips;
+    g_drawSkips = {};
+    return s;
+}
+
+// ---- the GamePad picture: as gfx/gl draw.cpp.
+// The GamePad's own buffers are not drawn (their depth clears are kept) unless the GamePad screen can be shown:
+// while the controller acts as the GamePad (gfxsw::gamepad_picture_drawn).
+bool skip_gamepad() {
+    return !gfxsw::gamepad_picture_drawn();
+}
+// ---- the TV picture, the other way round: in Off-TV Play the game still draws the TV's ("Currently playing on
+// Wii U GamePad", 1920x1080 docked, 1.8 ms of GPU a frame measured), which the Switch never shows while the window shows
+// the GamePad picture. A buffer the game sends to the TV, never to the GamePad, and that nothing else reads is the
+// TV's only; its draws and color clears are skipped while the last frame presented the GamePad picture (so the
+// TV's is drawn again at once when the window needs it: before the first GamePad picture, the Pro Controller).
+std::atomic<bool> g_skipAo{env_switch("SKIP_AO", false)};
+std::atomic<bool> g_skipTv{env_switch("SKIP_TV", true)};
+bool skip_tv() {
+    // the last frame showed the GamePad picture and this one will too (gamepad_view: what present() shows next), so
+    // the frame that switches to the TV picture (ZL + ZR + Minus, the Switch tab) has its TV draws drawn
+    return g_skipTv.load(std::memory_order_relaxed) && g_padShown.load(std::memory_order_relaxed) && gfxsw::gamepad_view();
+}
+bool tv_only(const Surface* s) {
+    constexpr uint64_t kReadWindow = 300;  // as gamepad_only
+    const bool unread = s->readFrame == ~0ull || R.frame - s->readFrame > kReadWindow;
+    return s->tvScanFrame != ~0ull && R.frame - s->tvScanFrame <= 60 && s->drcScanFrame == ~0ull && !s->gamepadSource &&
+           unread;
+}
+bool gamepad_only(const Surface* s) {
+    // a read by another draw or a copy keeps a buffer drawn, for 300 frames (gfx/gl)
+    constexpr uint64_t kReadWindow = 300;
+    const bool unread = s->readFrame == ~0ull || R.frame - s->readFrame > kReadWindow;
+    if (s->tvScanFrame != ~0ull) return false;
+    if (s->drcScanFrame != ~0ull && R.frame - s->drcScanFrame <= 60) return unread;
+    return s->gamepadSource && !s->tvShared && (unread || s->readFrame < s->gamepadSourceSince);
+}
+
+void draw_frame_start() {
+    // a new command list: whatever earlier frames bound is not relied upon
+    forget_state();
+    g_frameDraws = 0;
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        const char* submit = getenv("WWHD_DK_SUBMIT_DRAWS");
+        LOG("[dk] P4 lookup: memo by primitive class %s (WWHD_DK_MEMO_PRIM_CLASS)", g_primClass ? "on" : "off");
+        LOG("[dk] draw path: barrier per pass %s, submit every %s draws; trace draws %s",
+            !sync_lazy_barriers() ? "on" : "off (see GPU sync)",
+            submit && *submit ? submit : std::to_string(kDefaultSubmitDraws).c_str(), g_traceDraws ? "on" : "off");
+        static const char* const kAo[] = {"0, off: as the hardware renders it",
+                                          "1, the occlusion pass's centre depth fetch bilinear",
+                                          "2, the centre fetch bilinear and the noise tiled per 960x540 pixel"};
+        LOG("[dk] AO quirk fix: mode %s (WWHD_AO_MODE=0..2)", kAo[g_aoMode]);
+        static const char* const kProvoking[] = {"the last vertex, as gfx/gl", "the FIRST vertex (test)",
+                                                 "Latte's PROVOKING_VTX_LAST bit (test)"};
+        LOG("[dk] flat varyings: %s (WWHD_DK_PROVOKING_VERTEX=last|first|latte)", kProvoking[provoking_mode()]);
+        if (R.zcull)  // (off by default: fix-grass, backend.cpp)
+            LOG("[dk] zcull: on (queue), dropped after copies, uploads or new images of a depth buffer and %s; depth "
+                "clears reset it", sync_zcull_keep() ? "when another depth buffer or layer was bound since"
+                                                     : "at every depth-target bind");
+        sync_log_switches();
+        static const char* const kUf[] = {"0, packed into a new stream slice every draw (P2)",
+                                          "1, a copy per shader, a new slice only when a value changed",
+                                          "2, a copy per shader in one slice per frame, changed pieces pushed "
+                                          "(dkCmdBufPushConstants), no rebind"};
+        LOG("[dk] round 40: depth-only draws with an empty pixel shader %s (WWHD_DK_DEPTH_ONLY), texture lookups at "
+            "shared addresses cached %s (WWHD_DK_TEX_SHARED_CACHE), vertex layouts kept per vertex shader %s "
+            "(WWHD_DK_VTX_LAYOUT_CACHE); the Switch tab switches them while the game runs",
+            g_depthOnly.load() ? "on" : "off", g_texSharedCache.load() ? "on" : "off", g_vtxLayoutCache.load() ? "on" : "off");
+        LOG("[dk] resources (P4): ufBlock mode %s (WWHD_DK_UF_CACHE=0|1|2); textures and uniform blocks bound only "
+            "for slots that changed", kUf[g_ufMode]);
+    }
+}
+
+void log_resource_stats(uint64_t executed, uint64_t frames) {
+    const ResourcePerf p = g_res;
+    const UniformPackStats u = uniform_pack_stats_take();
+    g_res = {};
+    auto us = [&](uint64_t ns) { return executed ? double(ns) / 1e3 / double(executed) : 0.0; };
+    auto perDraw = [&](uint64_t n) { return executed ? double(n) / double(executed) : 0.0; };
+    auto perFrame = [&](uint64_t n) { return frames ? double(n) / double(frames) : 0.0; };
+    auto pct = [](uint64_t a, uint64_t b) { return b ? 100.0 * double(a) / double(b) : 0.0; };
+    LOG("[dk] resources us per draw: targets %.2f + uniform blocks %.2f + textures %.2f (misses %.2f: %.1f/frame, "
+        "%.2f us each; table %.0f%% of %.0f/frame) + ufBlock %.2f + descriptors %.2f; binds (in state) %.2f us: "
+        "textures %.2f calls %.2f handles of %.2f slots, uniform blocks %.2f calls %.2f buffers of %.2f slots; guest "
+        "uniform blocks %.2f/draw (%.0f%% already in the stream, %.0f%% by the memo); ufBlock mode %d: %.0f/frame, "
+        "%.0f%% unchanged, %.0f slices (%.0f KiB) + %.0f pushes (%.1f KiB) per frame; state us "
+        "per draw: ordering/targets/binds %.2f + fixed %.2f (%.0f%% skipped; kept by part (%s): rasterizer %.0f%%, "
+        "depth/stencil %.0f%%, color %.0f%%) + vertices %.2f (by layout identity (%s): attributes %.0f%%, buffer states "
+        "%.0f%%)",
+        us(p.targetNs), us(p.uboNs), us(p.textureNs), us(p.textureMissNs), perFrame(p.textureMisses),
+        p.textureMisses ? double(p.textureMissNs) / 1e3 / double(p.textureMisses) : 0.0,
+        pct(p.tableHits, p.tableLookups), perFrame(p.tableLookups), us(p.uniformNs), us(p.descriptorNs), us(p.bindNs),
+        perDraw(p.texBindCalls), perDraw(p.texHandles), perDraw(p.texWanted), perDraw(p.uboBindCalls),
+        perDraw(p.uboBuffers), perDraw(p.uboWanted), perDraw(p.uboBlocks), pct(p.uboReused, p.uboBlocks),
+        pct(p.uboMemoHits, p.uboBlocks), g_ufMode,
+        perFrame(u.blocks), pct(u.unchanged, u.blocks), perFrame(u.slices), perFrame(u.sliceBytes) / 1024.0,
+        perFrame(u.pushes), perFrame(u.pushBytes) / 1024.0, us(p.stateBindNs), us(p.stateFixedNs),
+        100.0 * perDraw(p.fixedSkips), g_fixedMemo.load() ? "on" : "OFF", 100.0 * perDraw(p.fixedRasterHits),
+        100.0 * perDraw(p.fixedDepthHits), 100.0 * perDraw(p.fixedColorHits), us(p.stateVertexNs),
+        g_vtxIdentity.load() ? "on" : "OFF", 100.0 * perDraw(p.attribSame), 100.0 * perDraw(p.bufferStateSame));
+    LOG("[dk] round 40 per frame: depth-only draws without their pixel shader %.0f (%s), with it %.0f (alpha test "
+        "%.0f, other discard %.0f, depth output or memory writes %.0f); texture lookups at shared addresses %.1f (%s), "
+        "cached hits %.0f; vertex layouts built %.1f (%s); submit every %u draws; render targets from the last "
+        "draw's lookup %.0f (register generations %s; state words by value %s), their scale/upload checks skipped %.0f",
+        perFrame(p.depthOnlyDraws), g_depthOnly.load() ? "on" : "OFF",
+        perFrame(std::max(std::max(p.keptAlphaTest, p.keptDiscard), p.keptDepthOrMemory)), perFrame(p.keptAlphaTest),
+        perFrame(p.keptDiscard), perFrame(p.keptDepthOrMemory), perFrame(p.sharedLookups),
+        g_texSharedCache.load() ? "cached" : "NOT cached", perFrame(p.sharedHits), perFrame(p.layoutBuilds),
+        g_vtxLayoutCache.load() ? "kept per vertex shader" : "NOT kept", g_submitDraws.load(),
+        perFrame(p.targetMemoHits), g_regGens.load() ? "on" : "OFF", g_targetMemo2.load() ? "on" : "OFF",
+        perFrame(p.targetChecksSkipped));
+}
+
+namespace {
+// The viewport. Latte maps clip-space y to window rows (row 0 at the top) as
+//     row = yc * ys + yo                      (ys = PA_CL_VPORT_YSCALE, yo = PA_CL_VPORT_YOFFSET)
+// which is what gfx/vulkan/draw.cpp's VkViewport {y = yo - ys, height = 2 ys} gives (Vulkan's clip y points
+// down; a negative height flips). deko3d 0.5.0 with DkDeviceFlags_OriginUpperLeft computes
+//     row = -(h / 2) * yd + (y + h / 2)       (dkCmdBufSetViewports: scaleY = -height / 2)
+// for the clip-space y it receives, yd, and its height must stay positive (the viewport's pixel rectangle is
+// computed in uint32_t). The game's vertex shaders negate y (SET_POSITION, dk.h), so yd = -yc and
+//     ys > 0:  h = 2 ys,   y = yo - ys     -> row = yc * ys + yo   (Vulkan's numbers, as they are)
+//     ys < 0:  a viewport swizzle negates y back (yd = yc), h = -2 ys, y = yo + ys
+//                                          -> row = -(-ys) * yc + yo + ys - ys = yc * ys + yo
+// Facing: deko3d's rasterizer decides it in framebuffer coordinates (row 0 at the top, deko3d's
+// windingFlip() is off with OriginUpperLeft), as Latte and Vulkan do; window positions are Latte's in both
+// cases, so Latte's front face is used unchanged.
+// Depth: the shaders' SET_POSITION gives z in 0..1 (Vulkan branch), so near/far are Vulkan's.
+void set_viewport(const uint32_t* r, float scale) {
+    const float xs = f32(r[REGADDR::PA_CL_VPORT_XSCALE]), xo = f32(r[REGADDR::PA_CL_VPORT_XOFFSET]);
+    const float ys = f32(r[REGADDR::PA_CL_VPORT_YSCALE]), yo = f32(r[REGADDR::PA_CL_VPORT_YOFFSET]);
+    const float zs = f32(r[REGADDR::PA_CL_VPORT_ZSCALE]), zo = f32(r[REGADDR::PA_CL_VPORT_ZOFFSET]);
+    LATTE_PA_CL_CLIP_CNTL clip;
+    memcpy((void*)&clip, r + REGADDR::PA_CL_CLIP_CNTL, 4);
+    const bool flip = ys < 0;
+    DkViewport v;
+    v.x = (xo - std::fabs(xs)) * scale;
+    v.width = 2 * std::fabs(xs) * scale;
+    v.y = (flip ? yo + ys : yo - ys) * scale;
+    v.height = 2 * std::fabs(ys) * scale;
+    v.near = clip.get_DX_CLIP_SPACE_DEF() ? zo : zo - zs;
+    v.far = zo + zs;
+    if (xs < 0) log_once(0x0E6A0000u, "[dk] negative viewport x scale (%s): drawn unmirrored", std::to_string(xs));
+    if (!gs.viewportKnown || !same_bytes(gs.viewport, v)) {
+        dkCmdBufSetViewports(R.cmd, 0, &v, 1);
+        gs.viewport = v;
+        gs.viewportKnown = true;
+    }
+    if (gs.swizzle != int(flip)) {
+        const DkViewportSwizzle sw = {DkSwizzle_PositiveX, flip ? DkSwizzle_NegativeY : DkSwizzle_PositiveY,
+                                      DkSwizzle_PositiveZ, DkSwizzle_PositiveW};
+        dkCmdBufSetViewportSwizzles(R.cmd, 0, &sw, 1);
+        gs.swizzle = int(flip);
+    }
+}
+
+// P4: triangle fans, quads, quad strips and line loops drawn with
+// deko3d's primitives of the same name (dkCmdBufDraw* passes the DkPrimitive to Maxwell's VERTEX_BEGIN_GL
+// unchanged; the 3D engine assembles all four itself, as nouveau's nvc0 driver uses them) instead of index
+// lists generated on the CPU: a non-indexed draw needs no index list at all, an indexed one only its byte
+// order changed, and quads read 4 indices per quad instead of 6. The triangles are the CPU conversion's
+// (quad a b c d: a b c and a c d). Flat varyings: a fan's and a line loop's provoking vertices with the last-
+// vertex convention are the conversion's; a quad's (and a quad strip's) is its last vertex for both of its
+// triangles where the conversion's lists give c then d, so a quad draw whose pixel shader reads a flat
+// varying (SPI_PS_INPUT_CNTL_n FLAT_SHADE, bit 10) stays converted, as do fans when flat varyings use
+// another convention (WWHD_DK_PROVOKING_VERTEX).
+bool native_primitive(const uint32_t* r, uint32_t prim, DkPrimitive& mode) {
+    const uint32_t inputs = std::min<uint32_t>(r[mmSPI_PS_IN_CONTROL_0] & 0x3F, 32);
+    bool flat = false;
+    for (uint32_t i = 0; i < inputs && !flat; i++) flat = (r[mmSPI_PS_INPUT_CNTL_0 + i] >> 10) & 1;
+    const bool lastVertex = provoking_vertex(r) == DkProvokingVertex_Last;
+    if (flat && (prim == 0x13 || prim == 0x14 || !lastVertex)) {
+        g_lookup.flatKeptConverted++;
+        return false;
+    }
+    switch (prim) {
+    case 5: mode = DkPrimitive_TriangleFan; g_lookup.nativeFans++; break;
+    case 0x12: mode = DkPrimitive_LineLoop; g_lookup.nativeLineLoops++; break;
+    case 0x13: mode = DkPrimitive_Quads; g_lookup.nativeQuads++; break;
+    case 0x14: mode = DkPrimitive_QuadStrip; g_lookup.nativeQuadStrips++; break;
+    default: return false;
+    }
+    return true;
+}
+
+void draw_impl(const uint32_t* r, uint32_t prim, uint32_t count, uint32_t indexType, uint32_t indexAddr,
+               uint32_t baseVertex, uint32_t instances);
+}  // namespace
+
+// A draw's vertex attribute layout: what the fetch shader and the vertex shader's attribute locations make of
+// the vertex buffers that have an address (raw unsigned fetches; the GLSL decodes them). The same for every draw
+// of one (fetch shader, vertex shader) pair with the same buffers bound, so each vertex shader keeps the last one
+// it was built for (Shader::vtxLayout; WWHD_DK_VTX_LAYOUT_CACHE). Per draw, only the buffers' addresses, sizes and
+// strides come from the registers.
+struct VertexLayout {
+    const LatteFetchShader* fs = nullptr;
+    uint64_t bound = 0;  // the fetch shader's buffer groups with an address (bit per group, in its order)
+    DkVtxAttribState attribs[kVtxAttribs];
+    uint32_t attribCount = 0;
+    struct Group {
+        uint32_t index;         // the attribute buffer (vertex buffer slot)
+        uint32_t attributeEnd;  // bytes of a vertex the attributes read
+        bool instance;          // read per instance
+    } groups[kVtxBuffers];
+    int groupCount = 0;
+    uint64_t build = 0;  // which build this is (unique over all layouts): draws compare it, not the attributes
+};
+namespace {
+const VertexLayout& vertex_layout(const uint32_t* r, LatteFetchShader* fs, Shader* vs) {
+    uint64_t bound = 0;
+    const size_t groupTotal = fs->bufferGroups.size();
+    for (size_t j = 0; j < groupTotal && j < 64; j++)
+        if (r[mmSQ_VTX_ATTRIBUTE_BLOCK_START + fs->bufferGroups[j].attributeBufferIndex * 7]) bound |= 1ull << j;
+    const bool cacheable = groupTotal <= 64 && g_vtxLayoutCache.load(std::memory_order_relaxed);
+    if (cacheable && vs->vtx && vs->vtx->fs == fs && vs->vtx->bound == bound) return *vs->vtx;
+    static VertexLayout scratch;  // (the cache off)
+    if (cacheable && !vs->vtx) {
+        vs->vtxLayout = std::make_shared<VertexLayout>();
+        vs->vtx = vs->vtxLayout.get();
+    }
+    VertexLayout& L = cacheable ? *vs->vtx : scratch;
+    g_res.layoutBuilds++;
+    static uint64_t builds = 0;
+    L.build = ++builds;
+    L.fs = fs;
+    L.bound = bound;
+    L.attribCount = 0;
+    L.groupCount = 0;
+    for (size_t j = 0; j < groupTotal; j++) {
+        const auto& g = fs->bufferGroups[j];
+        if (j < 64 ? !(bound >> j & 1) : !r[mmSQ_VTX_ATTRIBUTE_BLOCK_START + g.attributeBufferIndex * 7]) continue;
+        if (g.attributeBufferIndex >= kVtxBuffers) {
+            log_once(0xB0F00000u | g.attributeBufferIndex, "[dk] vertex buffer %s is past deko3d's 16: not fetched",
+                     std::to_string(g.attributeBufferIndex));
+            continue;
+        }
+        bool instance = false;
+        uint32_t attributeEnd = 0;
+        for (int k = 0; k < g.attribCount; k++) {
+            auto& a = g.attrib[k];
+            const int loc = vs->mapping.attributeMapping[a.semanticId];
+            if (loc < 0 || loc >= kVtxAttribs) continue;
+            DkVtxAttribSize asize;
+            uint32_t bytes;
+            if (!vertex_format(a.format, asize, bytes)) {
+                log_once(0xF0F00000u | uint32_t(a.format), "[dk] vertex format %s not fetched",
+                         std::to_string(uint32_t(a.format)));
+                continue;
+            }
+            if (a.offset > 0x3FFF) {
+                log_once(0x0FF50000u ^ a.offset, "[dk] vertex attribute offset %s past deko3d's 14 bits: not fetched",
+                         std::to_string(a.offset));
+                continue;
+            }
+            DkVtxAttribState v = zeroed<DkVtxAttribState>();
+            v.bufferId = g.attributeBufferIndex;
+            v.isFixed = 0;
+            v.offset = a.offset;
+            v.size = asize;
+            v.type = DkVtxAttribType_Uint;
+            while (L.attribCount <= uint32_t(loc)) {  // locations the shader does not read: a fixed zero
+                DkVtxAttribState fixed = zeroed<DkVtxAttribState>();
+                fixed.isFixed = 1;
+                fixed.size = DkVtxAttribSize_1x32;
+                fixed.type = DkVtxAttribType_Uint;
+                L.attribs[L.attribCount++] = fixed;
+            }
+            L.attribs[loc] = v;
+            attributeEnd = std::max<uint32_t>(attributeEnd, uint32_t(a.offset) + bytes);
+            if (a.fetchType == LatteConst::VertexFetchType2::INSTANCE_DATA) instance = true;
+        }
+        L.groups[L.groupCount++] = {g.attributeBufferIndex, attributeEnd, instance};
+    }
+    return L;
+}
+}  // namespace
+
+void draw(const uint32_t* r, uint32_t prim, uint32_t count, uint32_t indexType, uint32_t indexAddr, uint32_t baseVertex,
+          uint32_t instances) {
+    R.counts.draws++;
+    draw_impl(r, prim, count, indexType, indexAddr, baseVertex, instances);
+    // the GPU starts on the frame before it is complete: every g_submitDraws executed draws go to it
+    static uint64_t lastSubmit = 0;
+    const uint32_t submitDraws = g_submitDraws.load(std::memory_order_relaxed);
+    if (submitDraws && R.drawCount - lastSubmit >= submitDraws) {
+        lastSubmit = R.drawCount;
+        submit_commands("draws");
+    }
+}
+
+namespace {
+// (this fork, Picto Box black pictures) WWHD_DK_TRACE_TARGET=<hex address>,...: every draw into a color target at
+// one of these addresses gets the frame trace's draw lines (textures with /cpu when CPU data, shaders, state), and a
+// draw skipped for a pending or failed shader there is logged too; at most 4000 lines a session. An address with a '*' (drawn every frame) only gets a short line
+// in a ring of its last 32 draws, printed at the next draw into one of the other addresses
+struct TargetTrace {
+    std::vector<uint32_t> addrs, quiet;
+    uint32_t lines = 0;
+    std::array<std::string, 32> ring;
+    uint32_t ringNext = 0;
+    // WWHD_DK_TRACE_TARGET_CAPTURES=n: the first n frames with a drawn (not skipped) draw into one of the addresses
+    // are captured from that draw on (render targets and sampled textures, captures/<frame>/)
+    uint32_t captures = uint32_t(strtoul(getenv("WWHD_DK_TRACE_TARGET_CAPTURES") ? getenv("WWHD_DK_TRACE_TARGET_CAPTURES") : "0", nullptr, 10));
+    TargetTrace() {
+        const char* e = getenv("WWHD_DK_TRACE_TARGET");
+        for (const char* p = e; p && *p;) {
+            char* end;
+            const unsigned long v = strtoul(p, &end, 16);
+            if (end == p) break;
+            (*end == '*' ? quiet : addrs).push_back(uint32_t(v));
+            if (*end == '*') end++;
+            p = *end == ',' ? end + 1 : end;
+        }
+        if (!addrs.empty() || !quiet.empty())
+            LOG("[dk] WWHD_DK_TRACE_TARGET: draws into %zu color target address(es) traced, %zu in a ring", addrs.size(),
+                quiet.size());
+    }
+    uint64_t tracedFrame = ~0ull;  // the last frame with a draw into one of addrs: the '*' addresses traced in full too
+    bool wants(const uint32_t* r, uint64_t frame) {
+        if (addrs.empty() || lines >= 4000) return false;
+        for (int i = 0; i < 8; i++) {
+            const uint32_t a = r[mmCB_COLOR0_BASE + i];
+            if (std::find(addrs.begin(), addrs.end(), a) != addrs.end()) {
+                tracedFrame = frame;
+                return true;
+            }
+            if (frame == tracedFrame && std::find(quiet.begin(), quiet.end(), a) != quiet.end()) return true;
+        }
+        return false;
+    }
+    void note_quiet(const uint32_t* r, uint64_t frame, const char* shaders) {
+        if (quiet.empty() || lines >= 4000) return;
+        for (int i = 0; i < 8; i++) {
+            const uint32_t a = r[mmCB_COLOR0_BASE + i];
+            if (std::find(quiet.begin(), quiet.end(), a) == quiet.end()) continue;
+            const uint32_t info = r[mmCB_COLOR0_INFO + i];
+            char b[256];
+            snprintf(b, sizeof b, "frame %llu: c%d=%08X %ux%u fmt %X tile %u info %08X, d=%08X, vs %08X ps %08X %s, mask %08X",
+                     (unsigned long long)frame, i, a, r[mmCB_COLOR0_TILE + i] & 0xFFFF, r[mmCB_COLOR0_FRAG + i],
+                     (info >> 2) & 0x3F, (info >> 8) & 0xF, info, r[mmDB_DEPTH_BASE], r[mmSQ_PGM_START_VS] << 8,
+                     r[mmSQ_PGM_START_PS] << 8, shaders, r[REGADDR::CB_TARGET_MASK]);
+            ring[ringNext++ % ring.size()] = b;
+            return;
+        }
+    }
+    void dump_ring() {
+        const uint32_t n = std::min<uint32_t>(ringNext, ring.size());
+        for (uint32_t k = ringNext - n; k < ringNext; k++) LOG("[trace] ring %s", ring[k % ring.size()].c_str());
+        lines += n;
+        ringNext = 0;
+    }
+};
+TargetTrace& target_trace() {
+    static TargetTrace t;
+    return t;
+}
+// (this fork) whether WWHD_DK_TRACE_TARGET traces anything, known after the first draw: the trace's calls per draw
+// (its function-local static's guard, two address scans) were ~0.5% of the render thread with nothing to trace
+int8_t g_targetTraceOn = -1;
+inline bool target_trace_on() {
+    if (__builtin_expect(g_targetTraceOn >= 0, 1)) return g_targetTraceOn;
+    const TargetTrace& t = target_trace();
+    g_targetTraceOn = !t.addrs.empty() || !t.quiet.empty();
+    return g_targetTraceOn;
+}
+
+void draw_impl(const uint32_t* r, uint32_t prim, uint32_t count, uint32_t indexType, uint32_t indexAddr,
+               uint32_t baseVertex, uint32_t instances) {
+    static uint32_t drawSample = 0;
+    const bool timed = R.timedDraw = (++drawSample % kDrawTimeSample) == 0;
+    SampledTime timer{R.perf.drawNs, timed};
+    // (TP HD) rect lists: TP HD's own copy shaders (the GamePad minimap) pass four corners in quad order, drawn as
+    // a quad (as the TP HD recomp's Metal and Vulkan renderers do); a rect of three corners (the GPU makes the
+    // fourth) is skipped
+    if (prim == 0x11) {
+        if (count != 4) {
+            log_once(0xD0000011u, "[dk] rect list of %s vertices: draws skipped", std::to_string(count));
+            return;
+        }
+        prim = 0x13;
+    }
+    if (!count || !instances || ((prim == 0x13 || prim == 0x14) && count < 4)) return;
+    if (r[REGADDR::PA_CL_CLIP_CNTL] & (1 << 22)) return;  // rasterization disabled
+    shaders_draw_seen();
+    Lap lap{timed, timed ? now_ns() : 0};
+    const uint64_t drawStart = lap.at;
+    ((uint32_t*)r)[REGADDR::VGT_PRIMITIVE_TYPE] = prim;
+
+    // ---- shaders: the last draw's, a recent combination of programs and register state, or translate
+    Shader *vs, *ps;
+    LatteFetchShader* fs;
+    const uint64_t frame = R.frame + 1;  // the frame being recorded
+    const uint32_t primKey = prim_key(r, prim);
+    if (memo.gen == g_shader_state_gen && memo.frame == frame && memo.epoch == R.shaderEpoch && memo.prim == primKey) {
+        fs = memo.fs;
+        vs = memo.vs;
+        ps = memo.ps;
+        R.perf.memoHits++;
+    } else {
+        g_lookup.memoMisses++;
+        if (memo.frame != frame || memo.epoch != R.shaderEpoch) g_lookup.missFrame++;
+        else if (memo.gen != g_shader_state_gen) (memo.regsGen != g_shader_regs_gen ? g_lookup.missRegisters : g_lookup.missPrograms)++;
+        else g_lookup.missPrimitive++;
+        // the register part of the shader keys, kept while only programs change: one hash of both stages (vs;
+        // ps unused), and the per-stage cores only when translate needs them
+        static struct {
+            uint64_t gen = 0;
+            uint32_t prim = ~0u;
+            uint64_t vs = 0, ps = 0, vsCore = 0, psCore = 0;
+            bool cores = false;
+        } stateHash;
+        if (stateHash.gen != g_shader_regs_gen || stateHash.prim != primKey) {
+            const uint64_t t0 = R.timedDraw ? now_ns() : 0;
+            stateHash.vs = shader_combo_state_hash(r, primKey);
+            stateHash.ps = 0;
+            stateHash.cores = false;
+            stateHash.gen = g_shader_regs_gen;
+            stateHash.prim = primKey;
+            g_lookup.stateHashes++;
+            if (R.timedDraw) g_lookup.stateHashNs += (now_ns() - t0) * kDrawTimeSample;
+        }
+        // recent (programs, register state) combinations (gfx/gl): one made in an earlier frame is used again
+        // only if its programs still have the hashes they had (checked once per frame) and the fetch shader
+        // is the same. A combination whose shaders are not ready is not remembered.
+        struct Combo {
+            uint64_t frame = ~0ull, epoch = 0, vsState = 0, psState = 0;
+            uint32_t programs[6] = {};
+            LatteFetchShader* fs = nullptr;
+            Shader *vs = nullptr, *ps = nullptr;
+            void *vsRef = nullptr, *psRef = nullptr;  // program_hash_ref
+            uint64_t vsHash = 0, psHash = 0;
+            void* fsRef = nullptr;  // the fetch shader's hash entry, range and key (fast check)
+            uint32_t fsAddr = 0, fsSize = 0;
+            uint64_t fsKey = 0;
+        };
+        auto stillValid = [&](Combo& c) {
+            if (c.frame == frame) return true;
+            if (!c.vsRef || !c.psRef) return false;
+            g_lookup.validations++;
+            const uint64_t t0 = R.timedDraw ? now_ns() : 0;
+            bool valid;
+            if (c.fsRef) {
+                uint32_t fsAddr, fsSize;
+                valid = fetch_shader_range(r, fsAddr, fsSize) && fsAddr == c.fsAddr && fsSize == c.fsSize &&
+                        program_hash_of(c.fsRef, fsAddr, fsSize, frame) == c.fsKey;
+            } else {
+                uint64_t fsKey = 0;
+                valid = get_fetch_shader(r, &fsKey, frame) == c.fs;
+            }
+            valid = valid && program_hash_of(c.vsRef, c.programs[2] << 8, c.programs[3] << 3, frame) == c.vsHash &&
+                    program_hash_of(c.psRef, c.programs[4] << 8, c.programs[5] << 3, frame) == c.psHash;
+            if (R.timedDraw) g_lookup.validateNs += (now_ns() - t0) * kDrawTimeSample;
+            if (!valid) return false;
+            c.frame = frame;
+            return true;
+        };
+        // Round 45: 2-way sets (8192 x 2; was 4096 entries direct-mapped). Near Dragon Roost and the volcano ~2,500
+        // live combinations a frame thrashed the direct-mapped table: 35% hits, 1,800 full lookups (~3.5 us) a frame.
+        // A miss replaces the way used least recently (its frame).
+        static Combo combos[8192][2];
+        const uint32_t programs[6] = {r[mmSQ_PGM_START_FS], r[mmSQ_PGM_START_FS + 1], r[mmSQ_PGM_START_VS],
+                                      r[mmSQ_PGM_START_VS + 1], r[mmSQ_PGM_START_PS], r[mmSQ_PGM_START_PS + 1]};
+        uint64_t h = stateHash.vs * 31 + stateHash.ps;
+        for (uint32_t v : programs) h = (h ^ v) * 0x100000001B3ull;
+        Combo* set = combos[(h ^ (h >> 29)) & 8191];
+        Combo* hit = nullptr;
+        for (int way = 0; way < 2 && !hit; way++) {
+            Combo& w = set[way];
+            if (w.epoch == R.shaderEpoch && w.vsState == stateHash.vs && w.psState == stateHash.ps &&
+                !memcmp(w.programs, programs, sizeof programs) && stillValid(w))
+                hit = &w;
+        }
+        // the way to refill: an unused one, else the one used in the older frame
+        Combo& c = hit ? *hit
+                       : (set[0].frame == ~0ull || set[0].epoch != R.shaderEpoch) ? set[0]
+                       : (set[1].frame == ~0ull || set[1].epoch != R.shaderEpoch) ? set[1]
+                       : set[0].frame <= set[1].frame ? set[0] : set[1];
+        if (hit) {
+            R.perf.comboHits++;
+            fs = c.fs;
+            vs = c.vs;
+            ps = c.ps;
+        } else {
+            g_lookup.comboMisses++;
+            if (!stateHash.cores) {  // the per-stage hashes translate keys shaders by
+                shader_state_hash(r, true, &stateHash.vsCore);
+                shader_state_hash(r, false, &stateHash.psCore);
+                stateHash.cores = true;
+            }
+            uint64_t fsKey = 0;
+            fs = get_fetch_shader(r, &fsKey, frame);
+            vs = fs ? translate(r, true, fs, fsKey, frame, stateHash.vsCore) : nullptr;
+            ps = fs ? translate(r, false, fs, fsKey, frame, stateHash.psCore) : nullptr;
+            c.frame = frame;
+            c.epoch = R.shaderEpoch;
+            c.vsState = stateHash.vs;
+            c.psState = stateHash.ps;
+            memcpy(c.programs, programs, sizeof programs);
+            c.fs = fs;
+            c.vs = vs;
+            c.ps = ps;
+            const uint32_t vsAddr = programs[2] << 8, vsSize = programs[3] << 3, psAddr = programs[4] << 8,
+                           psSize = programs[5] << 3;
+            const bool hashable = vsAddr && vsSize && psAddr && psSize;
+            c.vsRef = hashable ? program_hash_ref(vsAddr, vsSize) : nullptr;
+            c.psRef = hashable ? program_hash_ref(psAddr, psSize) : nullptr;
+            c.vsHash = hashable ? program_hash_of(c.vsRef, vsAddr, vsSize, frame) : 0;
+            c.psHash = hashable ? program_hash_of(c.psRef, psAddr, psSize, frame) : 0;
+            c.fsRef = nullptr;
+            if (fs && fetch_shader_range(r, c.fsAddr, c.fsSize)) {
+                c.fsRef = program_hash_ref(c.fsAddr, c.fsSize);
+                c.fsKey = fsKey;
+            }
+            if (!(vs && ps && vs->ready() && ps->ready())) {  // looked up again next time
+                c.frame = ~0ull;
+                c.vsRef = c.psRef = nullptr;
+            }
+        }
+        memo = {g_shader_state_gen, frame, R.shaderEpoch, primKey, fs, vs, ps, g_shader_regs_gen};
+    }
+    // (WWHD_DK_TRACE_TARGET) this draw in the frame trace's lines, whatever the frame
+    const bool targetTraceOn = target_trace_on();
+    const bool targetTraced = targetTraceOn && target_trace().wants(r, frame);
+    if (targetTraceOn)
+        target_trace().note_quiet(r, frame,
+                                  !fs || !vs || !ps ? "none" : !vs->ready() || !ps->ready() ? "pending (skipped)" : "ready");
+    if (targetTraced) target_trace().dump_ring();
+    struct TraceScope {
+        bool on, frame, draws;
+        explicit TraceScope(bool o) : on(o), frame(g_traceFrame), draws(g_captureDraws) {
+            if (on) g_traceFrame = g_captureDraws = true;
+        }
+        ~TraceScope() {
+            if (on) g_traceFrame = frame, g_captureDraws = draws;
+        }
+    } traceScope(targetTraced);
+    if (targetTraced) {
+        target_trace().lines += 3;
+        if (!fs || !vs || !ps || !vs->ready() || !ps->ready())
+            LOG("[trace] frame %llu: a draw into %08X skipped: fetch shader %s, vs %08X %s, ps %08X %s",
+                (unsigned long long)frame, r[mmCB_COLOR0_BASE], fs ? "ok" : "none", r[mmSQ_PGM_START_VS] << 8,
+                !vs ? "none" : vs->ready() ? "ready" : vs->pending() ? "pending" : "failed", r[mmSQ_PGM_START_PS] << 8,
+                !ps ? "none" : ps->ready() ? "ready" : ps->pending() ? "pending" : "failed");
+        else {
+            LOG("[trace] frame %llu: a draw into %08X", (unsigned long long)frame, r[mmCB_COLOR0_BASE]);
+            if (target_trace().captures && !g_capture) {
+                target_trace().captures--;
+                capture_arm(kCaptureTargets | kCaptureTextures, "WWHD_DK_TRACE_TARGET_CAPTURES");
+            }
+        }
+    }
+    if (!fs) {
+        skip(g_drawSkips.noFetchShader);
+        return;
+    }
+    // (this fork) a draw into a 3D color target waits for its shaders instead of being skipped: the game draws the
+    // Picto Box's 8x8x8 color table there once, at the session's first picture, and samples it for every picture
+    // after; skipped for a shader still compiling, the table stayed zero and every picture was black until the game
+    // was closed (docs/picto-black-plan.md). At most one wait per shader.
+    if (vs && ps && ps->dec && (vs->pending() || ps->pending())) {
+        // the targets the draw writes, as the target lookup below finds them (a slot left set: not one of them)
+        const auto used = LatteMRT::GetActiveColorBufferMask(ps->dec, *reinterpret_cast<const LatteContextRegister*>(r));
+        bool volume = false;
+        for (int i = 0; i < 8; i++)
+            volume |= (used & (1 << i)) && (r[mmCB_COLOR0_TILE + i] & gx2::kColorTarget3D);
+        if (volume) {
+            shader_wait(vs);
+            shader_wait(ps);
+        }
+    }
+    if (!vs || !ps || !vs->ready() || !ps->ready()) {
+        // quietly: a pending shader asks the worker to hurry; a failed one was logged by the shader lane
+        bool failed = false;
+        for (Shader* sh : {vs, ps}) {
+            if (!sh || sh->ready()) continue;
+            if (sh->pending()) shader_wanted(sh);
+            else {
+                failed = true;
+                char what[64];
+                snprintf(what, sizeof what, "%s shader %016llx", sh->vertex ? "vertex" : "pixel",
+                         (unsigned long long)sh->glslHash);
+                log_once(sh->key ^ 0xFA11ED00ull, "[dk] draws with the failed %s skipped", what);
+            }
+        }
+        skip(failed || !vs || !ps ? g_drawSkips.shaderFailed : g_drawSkips.shaderPending);
+        return;
+    }
+    // the shaders' hot lines on their way while the indices and targets are worked out (WWHD_DK_PREFETCH)
+    const bool prefetch = g_prefetch.load(std::memory_order_relaxed);
+    if (prefetch) {
+        prefetch_shader(vs);
+        prefetch_shader(ps);
+    }
+    vs->drawnFrame = ps->drawnFrame = uint32_t(R.frame);  // (this fork, memory round 2) evict_idle_variants
+    lap(R.perf.lookupNs);
+
+    rprof::mark(rprof::kShader);  // (render_prof.h: sampled draws only)
+    // ---- indices
+    const bool stripRestart = indexAddr && (prim == 3 || prim == 6) && (r[REGADDR::VGT_MULTI_PRIM_IB_RESET_EN] & 1);
+    const uint32_t restartIndex = r[REGADDR::VGT_MULTI_PRIM_IB_RESET_INDX];
+    DkPrimitive mode;
+    switch (prim) {
+    case 1: mode = DkPrimitive_Points; break;
+    case 2: mode = DkPrimitive_Lines; break;
+    case 3: case 0x12: mode = DkPrimitive_LineStrip; break;
+    case 4: case 5: case 0x13: case 0x14: mode = DkPrimitive_Triangles; break;
+    case 6: mode = DkPrimitive_TriangleStrip; break;
+    default:
+        log_once(0xD0000000u | prim, "[dk] draws with the unsupported primitive type %s skipped", std::to_string(prim));
+        skip(g_drawSkips.unsupported);
+        return;
+    }
+    bool generated = prim == 5 || prim == 0x12 || prim == 0x13 || prim == 0x14;
+    if (generated && native_primitive(r, prim, mode)) generated = false;  // (P4, native_primitive)
+    else if (generated) g_lookup.convertedPrims++;
+    IndexList indices;
+    if (indexAddr || generated) {
+        // a native primitive's guest indices only change byte order (index_list's list conversion, prim 4)
+        indices = index_list(generated ? prim : (prim == 5 || prim >= 0x12 ? 4u : prim), count, indexType, indexAddr,
+                             stripRestart, restartIndex);
+        if (!indices.count) return;  // (a fan or quad list too short for one primitive)
+        if (!indices.slice) {
+            R.perf.streamFullSkips++;
+            skip(g_drawSkips.streamFull);
+            return;
+        }
+    }
+    const bool indexed = indices.format >= 0;
+    const uint64_t maxVertex = indexed ? uint64_t(indices.maxIndex) + baseVertex : uint64_t(baseVertex) + count - 1;
+    const uint64_t firstVertex = indexed ? uint64_t(indices.minIndex) + baseVertex : uint64_t(baseVertex);
+    lap(R.perf.indexNs);
+
+    if (prefetch) {  // (their lines have had the index stage to arrive) what they point to, and the units' surfaces
+        prefetch_shader_caches(vs);
+        prefetch_shader_caches(ps);
+        for (const Shader* sh : {vs, ps})
+            for (int i = 0; i < sh->texCount; i++)
+                if (const Surface* s = textureCache[sh->vertex ? kVertexStage : kPixelStage][sh->texUnit[i]].s)
+                    __builtin_prefetch(s);
+    }
+
+    rprof::mark(rprof::kIndices);
+    // ---- render targets
+    const auto& lcr = *reinterpret_cast<const LatteContextRegister*>(r);
+    std::array<Surface*, 8> colors{};
+    uint32_t slices[8]{}, depthSlice = 0;
+    bool srgbViews[8]{};  // a target bound in the sRGB twin of its surface's format
+    Surface* depth = nullptr;
+    // the last draw's lookup while no target register changed (gx2 g_reg_gen; WWHD_DK_REG_GENS), the surface set is
+    // the same and the pixel shader writes the same outputs. The registers LatteMRT's active-buffer masks read besides
+    // the buffers' (CB_COLOR_CONTROL, CB_TARGET_MASK, DB_DEPTH_CONTROL, PA_SC_GENERIC_SCISSOR_BR: kRegCatTargetState)
+    // change between many draws (depth writes, masks, scissors): compared by value (WWHD_DK_TARGET_MEMO2), else by
+    // their category's generation
+    struct TargetMemo {
+        uint64_t gen = ~0ull, stateGen = ~0ull, surfaceEpoch = 0, textureEpoch = 0;
+        uint64_t shaderEpoch = 0;  // (this fork, memory round 2) a freed variant's dec address can come back
+        uint64_t serial = 0;       // which lookup this is (the same-frame skip below)
+        uint32_t words[4]{};
+        const LatteDecompilerShader* dec = nullptr;
+        std::array<Surface*, 8> colors{};
+        uint32_t slices[8]{}, depthSlice = 0;
+        bool srgbViews[8]{};
+        Surface* depth = nullptr;
+    };
+    static TargetMemo tm;
+    const bool regGens = g_regGens.load(std::memory_order_relaxed);
+    const bool memo2 = g_targetMemo2.load(std::memory_order_relaxed);
+    const uint32_t stateWords[4] = {r[REGADDR::CB_COLOR_CONTROL], r[REGADDR::CB_TARGET_MASK], r[REGADDR::DB_DEPTH_CONTROL],
+                                    r[REGADDR::PA_SC_GENERIC_SCISSOR_BR]};
+    bool targetHit = false;
+    if (regGens && tm.gen == gx2::g_reg_gen[gx2::kRegCatTargets] && tm.surfaceEpoch == R.surfaceEpoch &&
+        tm.textureEpoch == R.textureEpoch && tm.shaderEpoch == R.shaderEpoch && tm.dec == ps->dec &&
+        (memo2 ? tm.words[0] == stateWords[0] && tm.words[1] == stateWords[1] && tm.words[2] == stateWords[2] &&
+                     tm.words[3] == stateWords[3]
+               : tm.stateGen == gx2::g_reg_gen[gx2::kRegCatTargetState])) {
+        targetHit = true;
+        colors = tm.colors;
+        memcpy(slices, tm.slices, sizeof slices);
+        memcpy(srgbViews, tm.srgbViews, sizeof srgbViews);
+        depth = tm.depth;
+        depthSlice = tm.depthSlice;
+        g_res.targetMemoHits++;
+    } else {
+        const auto mask = LatteMRT::GetActiveColorBufferMask(ps->dec, lcr);
+        for (int i = 0; i < 8; i++)
+            if (mask & (1 << i)) colors[i] = color_target(r, i, &slices[i], &srgbViews[i]);
+        depth = LatteMRT::GetActiveDepthBufferMask(lcr) ? depth_target(r, &depthSlice) : nullptr;
+        // (after the lookups, which may have made surfaces)
+        static uint64_t serials = 0;
+        tm.gen = gx2::g_reg_gen[gx2::kRegCatTargets];
+        tm.stateGen = gx2::g_reg_gen[gx2::kRegCatTargetState];
+        memcpy(tm.words, stateWords, sizeof stateWords);
+        tm.serial = ++serials;
+        tm.surfaceEpoch = R.surfaceEpoch;
+        tm.textureEpoch = R.textureEpoch;
+        tm.shaderEpoch = R.shaderEpoch;
+        tm.dec = ps->dec;
+        tm.colors = colors;
+        memcpy(tm.slices, slices, sizeof slices);
+        memcpy(tm.srgbViews, srgbViews, sizeof srgbViews);
+        tm.depth = depth;
+        tm.depthSlice = depthSlice;
+    }
+    // a depth buffer smaller than the color targets: deko3d clips drawing to the smallest target it binds (the
+    // screen scissor of dkCmdBufBindRenderTargets), Latte does not. The Picto Box draws its 1600x900 picture with the
+    // scene's depth buffer still bound, 1920x1080 on the Wii U but 1280x720 here (the game's low size, "Why 720p" in
+    // docs/switch-port.md): only 80% of the picture was drawn. A depth buffer this draw cannot change the outcome
+    // with (test ALWAYS, no depth or stencil writes) is left out.
+    if (depth) {
+        bool smaller = false;
+        for (auto* c : colors)
+            if (c && (c->width > depth->width || c->height > depth->height)) smaller = true;
+        if (smaller) {
+            LATTE_DB_DEPTH_CONTROL dc;
+            memcpy((void*)&dc, r + REGADDR::DB_DEPTH_CONTROL, 4);
+            const bool unused = !dc.get_STENCIL_ENABLE() &&  // (Z_FUNC 7: ALWAYS)
+                                (!dc.get_Z_ENABLE() || (uint32_t(dc.get_Z_FUNC()) == 7 && !dc.get_Z_WRITE_ENABLE()));
+            if (unused) {
+                depth = nullptr;
+            } else {
+                char t[64];
+                snprintf(t, sizeof t, "%08X %ux%u, DB_DEPTH_CONTROL %08X", depth->addr, depth->width, depth->height,
+                         r[REGADDR::DB_DEPTH_CONTROL]);
+                log_once(0xD5A11E0000000000ull | depth->addr,
+                         "[dk] depth buffer %s smaller than a color target and used: drawing stops at its size", t);
+            }
+        }
+    }
+    // Same-frame skip (WWHD_DK_TARGET_MEMO2): the memo's lookup, whose scale fits and uploads below already ran in this
+    // frame with nothing left to do (every target at the scale it should have, upload_surface checked them), with the
+    // same depth buffer after the test above: no surface or texture epoch moved since (a rescale, a new image, a first
+    // GPU write or a CPU write all move one), so they would do nothing again. Not when the scan buffer is one of them
+    // (before_write flushes it), nor for a target at its HUD size (hudFull: its wanted scale changes without an epoch
+    // when that ends, so neither the checks recorded nor the draw may have one).
+    struct TargetChecks {
+        uint64_t serial = 0, frame = ~0ull;
+        const Surface* depth = nullptr;
+    };
+    static TargetChecks tc;
+    bool checked = targetHit && memo2 && tc.serial == tm.serial && tc.frame == R.frame && tc.depth == depth &&
+                   (!S.scanSrc || S.scanSrc != depth);
+    if (checked)
+        for (auto* c : colors)
+            if (c && (c == S.scanSrc || c->hudFull)) checked = false;
+    bool settled = false;
+    if (checked) g_res.targetChecksSkipped++;
+    else {
+    // each render target at the internal resolution it should have now (rescale_surface keeps contents); when
+    // some could take it but others wait for an allocation budget, all of them take it now
+    if (depth) {
+        before_write(depth);
+        fit_scale(depth, true);
+    }
+    float shared = depth ? depth->scale : 0.0f;
+    bool mixed = false;
+    for (auto* c : colors)
+        if (c) {
+            before_write(c);
+            if (c->hudFull && depth) c->hudFull = false;
+            fit_scale(c, true);
+            if (shared == 0.0f) shared = c->scale;
+            mixed |= c->scale != shared;
+        }
+    if (mixed) {  // some took the new scale, some wait for an allocation: all of them now
+        if (depth) fit_scale(depth, true, true);
+        for (auto* c : colors)
+            if (c) fit_scale(c, true, true);
+    }
+    if (memo2) {  // whether the memo's next hits in this frame can skip the checks
+        settled = scale_settled(depth);
+        for (auto* c : colors)
+            if (c) settled &= !c->hudFull && scale_settled(c);
+    }
+    }
+    Surface* target = depth;
+    for (auto* c : colors)
+        if (c) {
+            target = c;
+            break;
+        }
+    if (!target) {
+        skip(g_drawSkips.noTarget);
+        return;
+    }
+    // (TP HD) a 3D draw: what its targets show is read again (post-processing) before the HUD switch below takes
+    // them (cleared before this draw's textures note their reads)
+    if (depth)
+        for (auto* c : colors)
+            if (c) c->readAfterScene = false;
+    g_drawScale = target->scale;
+    if (depth && depth->scale != g_drawScale)
+        log_once(0x5CA1E000u ^ depth->addr, "[dk] draw with targets at different internal resolutions: %s",
+                 trace_name(depth) + " at " + std::to_string(depth->scale) + ", color at " + std::to_string(g_drawScale));
+    bool gamepadDraw = target != depth;  // (a draw without a color target is not classified)
+    for (auto* c : colors)
+        if (c && !gamepad_only(c)) gamepadDraw = false;
+    if (gamepadDraw) {
+        R.perf.gamepadDraws++;
+        if (skip_gamepad()) {
+            R.perf.gamepadSkipped++;
+            for (auto* c : colors)
+                if (c && !c->skipLogged) {
+                    c->skipLogged = true;
+                    LOG("[dk] draws into %s skipped from frame %llu: GamePad picture only",
+                        trace_name(c).c_str(), (unsigned long long)frame);
+                }
+            return;
+        }
+    }
+    if (target != depth && skip_tv()) {
+        bool tvDraw = true;
+        for (auto* c : colors)
+            if (c && !tv_only(c)) tvDraw = false;
+        if (tvDraw) {
+            R.perf.tvSkipped++;
+            for (auto* c : colors)
+                if (c && !c->skipLogged) {
+                    c->skipLogged = true;
+                    LOG("[dk] draws into %s skipped from frame %llu: TV picture only (the window shows the GamePad's)",
+                        trace_name(c).c_str(), (unsigned long long)frame);
+                }
+            return;
+        }
+    }
+    if (!checked) {
+        for (auto* c : colors)
+            if (c) upload_surface(c);
+        if (depth) upload_surface(depth);
+        // (after the uploads, which could rescale) the checks done for the memo's lookup in this frame
+        if (settled && memo2 && tm.surfaceEpoch == R.surfaceEpoch && tm.textureEpoch == R.textureEpoch)
+            tc = {tm.serial, R.frame, depth};
+        else
+            tc.serial = 0;
+    }
+    lap.sub(g_res.targetNs);
+
+    // ---- the scissor (before anything is uploaded for a draw that would be discarded)
+    uint32_t sx, sy, sex, sey;
+    // in image pixels, outward (again after the HUD switch below changes the scale)
+    const auto scale_scissor = [&](uint32_t x, uint32_t y, uint32_t ex, uint32_t ey) {
+        sx = x, sy = y, sex = ex, sey = ey;
+        if (g_drawScale != 1.0f) {
+            sx = uint32_t(float(x) * g_drawScale);
+            sy = uint32_t(float(y) * g_drawScale);
+            sex = std::min(scaled_size(ex, g_drawScale), target->img.pw);
+            sey = std::min(scaled_size(ey, g_drawScale), target->img.ph);
+        }
+    };
+    uint32_t gsx, gsy, gsex, gsey;  // the game's scissor, in the buffer's pixels
+    {
+        const uint32_t width = target->width, height = target->height;
+        const uint32_t tl = r[REGADDR::PA_SC_GENERIC_SCISSOR_TL], br = r[REGADDR::PA_SC_GENERIC_SCISSOR_BR];
+        gsx = std::min(tl & 0x7fff, width);
+        gsy = std::min((tl >> 16) & 0x7fff, height);
+        gsex = std::min(br & 0x7fff, width);
+        gsey = std::min((br >> 16) & 0x7fff, height);
+        if (gsex <= gsx || gsey <= gsy) {
+            skip(g_drawSkips.scissorEmpty);
+            return;
+        }
+        scale_scissor(gsx, gsy, gsex, gsey);
+    }
+
+    // a depth-only draw whose pixel shader changes nothing it writes: the empty pixel shader, no pixel-stage
+    // resources (WWHD_DK_DEPTH_ONLY)
+    const DkShader* const depthOnlyFs =
+        target == depth && !ps->fragmentEffects && g_depthOnly.load(std::memory_order_relaxed) ? shader(kDepthOnlyFs)
+                                                                                                : nullptr;
+    const bool depthOnly = depthOnlyFs != nullptr;
+    g_res.depthOnlyDraws += depthOnly;
+    if (target == depth && ps->fragmentEffects) {
+        g_res.keptAlphaTest += (ps->fragmentWhy & 1) != 0;
+        g_res.keptDiscard += (ps->fragmentWhy & 2) != 0;
+        g_res.keptDepthOrMemory += (ps->fragmentWhy & 4) != 0;
+    }
+
+    rprof::mark(rprof::kTargets);
+    // ---- textures and uniform blocks (may upload and copy; nothing of the draw is bound yet)
+    static StageBindings stages[2];
+    g_gamepadDrawing = gamepadDraw;
+    g_drawSamplesRendered = false;
+    g_drawSamplesBoundDepth = false;
+    {
+        LATTE_DB_DEPTH_CONTROL dc;
+        memcpy((void*)&dc, r + REGADDR::DB_DEPTH_CONTROL, 4);
+        // (as the depth/stencil state below: depth writes need the depth test; a stencil test may write)
+        g_drawDepthWrites = depth && ((dc.get_Z_ENABLE() && dc.get_Z_WRITE_ENABLE()) ||
+                                      (depth->fmt.stencil && dc.get_STENCIL_ENABLE()));
+    }
+    sync_draw_begin();
+    g_traceTextures.clear();
+    g_traceVertices.clear();
+    if (g_capture) capture_draw_begin();
+    lap.sub(g_res.targetNs);  // (the scissor)
+    if (depthOnly) stages[kPixelStage].texMask = stages[kPixelStage].uboMask = 0;
+    if (!prepare_stage(r, vs, colors, depth, stages[kVertexStage], lap) ||
+        (!depthOnly && !prepare_stage(r, ps, colors, depth, stages[kPixelStage], lap))) {
+        R.perf.streamFullSkips++;
+        skip(g_drawSkips.streamFull);
+        return;
+    }
+    // The HUD at full resolution (gfx/gl draw.cpp): the game draws it into the same buffer as the scene, last,
+    // after the post-processing that reads the scene. At a lower internal resolution, the first draw into the TV
+    // picture's buffer that comes after a read of it this frame (and since its last 3D draw: readAfterScene, TP HD),
+    // has no depth buffer and samples only the game's own textures (nothing rendered) switches that buffer to its
+    // full-size image, the scene scaled up into it;
+    // the next frame's clear (or 3D drawing) switches back. With edge smoothing on (issue #21), the scene goes
+    // through FXAA there, at any internal resolution (fxaa_scene), so the HUD drawn after it stays sharp
+    // (FXAA's setting read only for the draws that can be the HUD switch: it was read on every draw)
+    if (!depth && colors[0] == target && target->readFrame == R.frame && target->readAfterScene &&
+        !g_drawSamplesRendered && (target->scale < 1.0f || fxaa_enabled()) && target == shown_source()) {
+        const bool smooth = fxaa_enabled();
+        bool single = true;
+        for (int i = 1; i < 8; i++)
+            if (colors[i]) single = false;
+        if (single) {
+            const bool scaled = target->scale < 1.0f;
+            if (!(smooth && fxaa_scene(target)) && target->scale < 1.0f) {
+                target->hudFull = true;
+                fit_scale(target, true, true);
+            }
+            if (g_drawScale != target->scale) {  // the scissor was scaled for the old image
+                g_drawScale = target->scale;
+                scale_scissor(gsx, gsy, gsex, gsey);
+            }
+            if (scaled) R.perf.hudSwitches++;
+        }
+    }
+    // the loose uniforms (ufBlock) of each stage, packed at the targets' scale
+    for (Shader* sh : {vs, ps}) {
+        if (depthOnly && !sh->vertex) continue;
+        const int slot = sh->ufBlockSlot;
+        if (slot < 0) continue;
+        const bool aoNoise = g_aoMode == 2 && sh->vertex && is_occlusion(r, true);
+        const float(*texScale)[2] = g_unitScale[sh->vertex ? kVertexStage : kPixelStage];
+        const StreamSlice u =
+            g_ufMode ? pack_uniforms_cached(g_ufMode, sh->vertex, *sh, r, g_drawScale, g_drawScale, texScale, aoNoise)
+                     : pack_uniforms(sh->vertex, *sh, r, g_drawScale, g_drawScale, texScale, aoNoise);
+        if (!u) {
+            R.perf.streamFullSkips++;
+            skip(g_drawSkips.streamFull);
+            return;
+        }
+        StageBindings& b = stages[sh->vertex ? kVertexStage : kPixelStage];
+        b.ubo[slot] = {u.gpu, u.size};
+        b.uboMask |= 1u << slot;
+    }
+    lap.sub(g_res.uniformNs);
+    commit_descriptors();  // the descriptors this draw's textures were given
+    lap.sub(g_res.descriptorNs);
+
+    rprof::mark(rprof::kTextures);
+    // ---- GPU ordering (dk_sync.h): the barrier this draw's reads and writes need against earlier draws and
+    // clears (with hazard tracking; the old path has one at every change of targets, below)
+    sync_draw_check(colors, depth, g_drawDepthWrites, g_drawSamplesBoundDepth);
+
+    // ---- render targets: bound when they change (deko3d binds color targets 0..n-1 without gaps: a gap gets
+    // the first color target's view with its writes masked off below)
+    sync_cache();
+    {
+        if (gs.targetsTextureEpoch != R.textureEpoch) gs.targetsKnown = false;
+        bool same = gs.targetsKnown && gs.depth == depth && gs.depthSlice == depthSlice;
+        for (int i = 0; i < 8 && same; i++)
+            same = gs.colors[i] == colors[i] && gs.slices[i] == slices[i] && gs.srgbViews[i] == srgbViews[i];
+        if (!same) {
+            static const bool passBarrier = !sync_lazy_barriers();
+            // the old path (WWHD_DK_LAZY_BARRIERS=0): what earlier passes rendered becomes visible to this pass's
+            // texture reads (plan section 6.3: conservative, one barrier per change of targets). zcull: deko3d
+            // drops it itself only when the depth target's address changes; copies, uploads and reused heap
+            // memory keep the address (R.zcullEpoch), and with WWHD_DK_ZCULL_KEEP=0 it is dropped at every bind
+            const bool dropZcull = sync_zcull_bind(depth, depthSlice);
+            if (dropZcull) sync_zcull_dropped();
+            if (passBarrier)
+                sync_barrier(DkBarrier_Fragments, DkInvalidateFlags_Image | (dropZcull ? DkInvalidateFlags_Zcull : 0u),
+                             SyncWhy::PassChange);
+            else if (dropZcull)
+                dkCmdBufBarrier(R.cmd, DkBarrier_None, DkInvalidateFlags_Zcull);
+            if (depth) g_zcullSeen = R.zcullEpoch;
+            int n = 0, first = -1;
+            for (int i = 0; i < 8; i++)
+                if (colors[i]) {
+                    n = i + 1;
+                    if (first < 0) first = i;
+                }
+            DkImageView views[8], depthView;
+            const DkImageView* viewPtrs[8];
+            for (int i = 0; i < n; i++) {
+                const int c = colors[i] ? i : first;
+                target_view(colors[c], 0, slices[c], &views[i], srgbViews[c]);
+                viewPtrs[i] = &views[i];
+            }
+            if (depth) target_view(depth, 0, depthSlice, &depthView);
+            dkCmdBufBindRenderTargets(R.cmd, viewPtrs, uint32_t(n), depth ? &depthView : nullptr);
+            gs.colors = colors;
+            memcpy(gs.slices, slices, sizeof slices);
+            memcpy(gs.srgbViews, srgbViews, sizeof srgbViews);
+            gs.depth = depth;
+            gs.depthSlice = depthSlice;
+            gs.targetsKnown = true;
+            gs.targetsTextureEpoch = R.textureEpoch;
+            gs.colorWriteKnown = false;  // the gap targets' masks
+            if (g_traceFrame) trace_pass(colors, depth);
+            gpu_pass_mark("draw", first >= 0 ? colors[first] : nullptr, depth);
+        }
+    }
+
+    // the bound depth buffer's contents changed outside the 3D engine since its zcull data was gathered (a copy
+    // or upload into it, R.zcullEpoch): dropped, as at a change of targets
+    if (depth && g_zcullSeen != R.zcullEpoch) {
+        dkCmdBufBarrier(R.cmd, DkBarrier_None, DkInvalidateFlags_Zcull);
+        g_zcullSeen = R.zcullEpoch;
+        sync_zcull_reset(depth, depthSlice);
+    }
+    sync_draw_mark(colors, depth, g_drawDepthWrites);
+
+    rprof::mark(rprof::kPass);
+    // ---- shaders, textures, uniform blocks
+    const DkShader* const fsh = depthOnly ? depthOnlyFs : &ps->dk;
+    if (gs.vs != &vs->dk || gs.ps != fsh) {
+        const DkShader* shaders[] = {&vs->dk, fsh};
+        dkCmdBufBindShaders(R.cmd, DkStageFlag_Vertex | DkStageFlag_Fragment, shaders, 2);
+        gs.vs = &vs->dk;
+        gs.ps = fsh;
+    }
+    {
+        const uint64_t bindStart = timed ? now_ns() : 0;
+        bind_stage(kVertexStage, stages[kVertexStage]);
+        bind_stage(kPixelStage, stages[kPixelStage]);
+        if (timed) g_res.bindNs += (now_ns() - bindStart) * kDrawTimeSample;
+    }
+
+    rprof::mark(rprof::kDescriptors);
+    // ---- viewport, scissor
+    {
+        static uint64_t vpGen = ~0ull, vpEpoch = 0;
+        static float vpScale = 0;
+        const uint64_t gen = gx2::g_reg_gen[gx2::kRegCatViewport];
+        if (!regGens || gen != vpGen || vpScale != g_drawScale || vpEpoch != gs.epoch || !gs.viewportKnown) {
+            set_viewport(r, g_drawScale);
+            vpGen = gen;
+            vpScale = g_drawScale;
+            vpEpoch = gs.epoch;
+        }
+    }
+    {
+        const DkScissor sc = {sx, sy, sex - sx, sey - sy};
+        if (!gs.scissorKnown || !same_bytes(gs.scissor, sc)) {
+            dkCmdBufSetScissors(R.cmd, 0, &sc, 1);
+            gs.scissor = sc;
+            gs.scissorKnown = true;
+        }
+    }
+
+    // ---- rasterizer
+    const uint64_t fixedStart = timed ? now_ns() : 0;
+    LATTE_PA_SU_SC_MODE_CNTL pm;
+    memcpy((void*)&pm, r + REGADDR::PA_SU_SC_MODE_CNTL, 4);
+    LATTE_PA_CL_CLIP_CNTL clip;
+    memcpy((void*)&clip, r + REGADDR::PA_CL_CLIP_CNTL, 4);
+    // The fixed state (rasterizer, depth / stencil, color output) comes from these registers and the targets'
+    // kinds only: when they are the last draw's (that bound it, same state cache epoch), nothing is rebuilt
+    // (WWHD_DK_FIXED_SKIP, on unless 0; the Switch tab turns it on and off)
+    const bool fixedSkipOn = g_fixedSkip.load(std::memory_order_relaxed);
+    struct FixedKey {
+        uint32_t words[25];
+        const Surface* depth;
+        uint32_t colorMask, floatMask, stencilFmt, points;
+        float scale;
+    };
+    static FixedKey lastFixed;
+    static uint64_t lastFixedEpoch = ~0ull;
+    // In three parts (WWHD_DK_FIXED_MEMO): the rasterizer, the depth/stencil and the color output each skipped while
+    // their own register words (and the inputs from the targets) are the ones they were last built from in this state
+    // cache epoch; a draw that changes only the depth writes or a blend rebuilds that part alone, and A -> B -> A
+    // hits too. Each part is the only writer of its StateCache fields, so the last build of a part is what is bound.
+    struct RasterKey {
+        uint32_t words[4];  // PA_SU_SC_MODE_CNTL, PA_CL_CLIP_CNTL, the front poly offset and scale
+        uint32_t points, pointSize;
+        float pointScale;
+    };
+    struct DepthKey {
+        uint32_t words[3];  // DB_DEPTH_CONTROL, DB_STENCILREFMASK, DB_STENCILREFMASK_BF
+        uint32_t depth;     // 1: a depth buffer, 3: one with stencil
+    };
+    struct ColorKey {
+        uint32_t words[14];  // CB_COLOR_CONTROL, CB_TARGET_MASK, CB_BLEND0..7_CONTROL, CB_BLEND_RED..ALPHA
+        uint32_t colorMask, floatMask;
+    };
+    static RasterKey lastRaster;
+    static DepthKey lastDepth;
+    static ColorKey lastColor;
+    static uint64_t rasterEpoch = ~0ull, depthEpoch = ~0ull, colorEpoch = ~0ull;
+    const bool fixedParts = fixedSkipOn && g_fixedMemo.load(std::memory_order_relaxed);
+    bool doRaster = true, doDepth = true, doColor = true;
+    uint32_t colorMask = 0, floatMask = 0;
+    for (uint32_t i = 0; i < 8; i++)
+        if (colors[i]) {
+            colorMask |= 1u << i;
+            if (colors[i]->fmt.kind == FormatInfo::FLOAT) floatMask |= 1u << i;
+        }
+    if (fixedParts) {
+        const bool points = prim == 1;
+        const RasterKey rk = {{r[REGADDR::PA_SU_SC_MODE_CNTL], r[REGADDR::PA_CL_CLIP_CNTL],
+                               r[REGADDR::PA_SU_POLY_OFFSET_FRONT_OFFSET], r[REGADDR::PA_SU_POLY_OFFSET_FRONT_SCALE]},
+                              points, points ? r[REGADDR::PA_SU_POINT_SIZE] : 0u, points ? g_drawScale : 0.0f};
+        const DepthKey dk = {{r[REGADDR::DB_DEPTH_CONTROL], r[REGADDR::DB_STENCILREFMASK], r[REGADDR::DB_STENCILREFMASK_BF]},
+                             depth ? (depth->fmt.stencil ? 3u : 1u) : 0u};
+        ColorKey ck;
+        ck.words[0] = r[REGADDR::CB_COLOR_CONTROL];
+        ck.words[1] = r[REGADDR::CB_TARGET_MASK];
+        for (uint32_t i = 0; i < 8; i++) ck.words[2 + i] = r[REGADDR::CB_BLEND0_CONTROL + i];
+        for (uint32_t i = 0; i < 4; i++) ck.words[10 + i] = r[REGADDR::CB_BLEND_RED + i];
+        ck.colorMask = colorMask;
+        ck.floatMask = floatMask;
+        doRaster = !(rasterEpoch == gs.epoch && gs.rasterKnown && same_bytes(rk, lastRaster));
+        doDepth = !(depthEpoch == gs.epoch && gs.depthStencilKnown && same_bytes(dk, lastDepth));
+        doColor = !(colorEpoch == gs.epoch && gs.colorKnown && gs.colorWriteKnown && same_bytes(ck, lastColor));
+        g_res.fixedRasterHits += !doRaster;
+        g_res.fixedDepthHits += !doDepth;
+        g_res.fixedColorHits += !doColor;
+        if (doRaster) lastRaster = rk, rasterEpoch = gs.epoch;  // (gs.epoch: the parts below change no epoch)
+        if (doDepth) lastDepth = dk, depthEpoch = gs.epoch;
+        if (doColor) lastColor = ck, colorEpoch = gs.epoch;
+        if (doRaster || doDepth || doColor) lastFixedEpoch = ~0ull;  // (the single memo's key no longer what is bound)
+        else g_res.fixedSkips++;
+    } else {
+    FixedKey fk;
+    memset(&fk, 0, sizeof fk);
+    {
+        static const uint32_t kFixedRegs[25] = {
+            REGADDR::PA_SU_SC_MODE_CNTL, REGADDR::PA_CL_CLIP_CNTL, REGADDR::PA_SU_POLY_OFFSET_FRONT_OFFSET,
+            REGADDR::PA_SU_POLY_OFFSET_FRONT_SCALE, REGADDR::PA_SU_POLY_OFFSET_CLAMP, REGADDR::DB_DEPTH_CONTROL,
+            REGADDR::DB_STENCILREFMASK, REGADDR::DB_STENCILREFMASK_BF, REGADDR::CB_COLOR_CONTROL, REGADDR::CB_TARGET_MASK,
+            REGADDR::CB_BLEND0_CONTROL + 0, REGADDR::CB_BLEND0_CONTROL + 1, REGADDR::CB_BLEND0_CONTROL + 2,
+            REGADDR::CB_BLEND0_CONTROL + 3, REGADDR::CB_BLEND0_CONTROL + 4, REGADDR::CB_BLEND0_CONTROL + 5,
+            REGADDR::CB_BLEND0_CONTROL + 6, REGADDR::CB_BLEND0_CONTROL + 7, REGADDR::CB_BLEND_RED + 0,
+            REGADDR::CB_BLEND_RED + 1, REGADDR::CB_BLEND_RED + 2, REGADDR::CB_BLEND_RED + 3, REGADDR::PA_SU_POINT_SIZE,
+            REGADDR::PA_SU_SC_MODE_CNTL, REGADDR::PA_SU_SC_MODE_CNTL};  // (the last two: padding)
+        if (regGens) {  // the registers' change count instead of their values (gx2 g_reg_gen)
+            const uint64_t gen = gx2::g_reg_gen[gx2::kRegCatFixed];
+            fk.words[0] = uint32_t(gen);
+            fk.words[1] = uint32_t(gen >> 32);
+            fk.words[2] = 0x6E6E6547u;  // (never equal to a key of register values: PA_CL_CLIP_CNTL is not this)
+        } else
+            for (int i = 0; i < 25; i++) fk.words[i] = r[kFixedRegs[i]];
+        fk.depth = depth;
+        fk.colorMask = colorMask;
+        fk.floatMask = floatMask;
+        fk.stencilFmt = depth && depth->fmt.stencil;
+        fk.points = prim == 1;
+        fk.scale = g_drawScale;
+    }
+    const bool fixedSame = fixedSkipOn && lastFixedEpoch == gs.epoch && gs.rasterKnown && gs.depthStencilKnown &&
+                           gs.colorKnown && gs.colorWriteKnown && !memcmp(&fk, &lastFixed, sizeof fk);
+    if (fixedSame) {
+        g_res.fixedSkips++;
+        doRaster = doDepth = doColor = false;
+    } else {
+        lastFixed = fk;
+        lastFixedEpoch = gs.epoch;
+        rasterEpoch = depthEpoch = colorEpoch = ~0ull;  // (the three memos' keys: not what this build binds)
+    }
+    }
+    if (doRaster) {
+        DkRasterizerState rs = zeroed<DkRasterizerState>();
+        dkRasterizerStateDefaults(&rs);
+        // depth clamp (no far clipping) when the game turns far-plane clipping off; deko3d's depth clamp also
+        // drops near clipping, as GL's did before gfx/gl added its clip distance (P3)
+        rs.depthClampEnable = clip.get_ZCLIP_FAR_DISABLE();
+        const bool cullFront = pm.get_CULL_FRONT(), cullBack = pm.get_CULL_BACK();
+        rs.cullMode = cullFront && cullBack ? DkFace_FrontAndBack : cullFront ? DkFace_Front : cullBack ? DkFace_Back : DkFace_None;
+        const bool ccw = pm.get_FRONT_FACE() == LATTE_PA_SU_SC_MODE_CNTL::E_FRONTFACE::CCW;
+        rs.frontFace = ccw ? DkFrontFace_CCW : DkFrontFace_CW;  // (set_viewport: Latte's facing)
+        // flat varyings' vertex: the last, as gfx/gl (it never calls glProvokingVertex: GL's default
+        // GL_LAST_VERTEX_CONVENTION, and the triangle lists both make of fans and quads have the same order)
+        rs.provokingVertex = provoking_vertex(r);
+        const bool offset = pm.get_OFFSET_FRONT_ENABLED();
+        rs.depthBiasEnableMask = offset ? DkPolygonFlag_All : 0;
+        // (on with zcull; WWHD_DK_ZCULL_BIAS_FIX=0 turns it off, a test) zcull's per-tile depth range comes from draws
+        // without the bias, so a depth-biased decal can lose whole 4x8 tiles; the data is dropped before each run
+        // of depth-biased draws
+        static const bool biasFix = R.zcull && !(getenv("WWHD_DK_ZCULL_BIAS_FIX") && *getenv("WWHD_DK_ZCULL_BIAS_FIX") == '0');
+        static bool lastOffset = false;
+        if (biasFix && offset && !lastOffset) {
+            dkCmdBufBarrier(R.cmd, DkBarrier_None, DkInvalidateFlags_Zcull);
+            sync_zcull_dropped();
+        }
+        lastOffset = offset;
+        if (!gs.rasterKnown || !same_bytes(gs.raster, rs)) {
+            dkCmdBufBindRasterizerState(R.cmd, &rs);
+            gs.raster = rs;
+            gs.rasterKnown = true;
+        }
+        if (offset) {
+            // gfx/gl's glPolygonOffset(scale / 16, offset): Mesa programs no clamp (0); deko3d doubles the units
+            // as Mesa nvc0 does (the clamp from Latte's PA_SU_POLY_OFFSET_CLAMP was the P2-P4 path: grass specks)
+            const float units = f32(r[REGADDR::PA_SU_POLY_OFFSET_FRONT_OFFSET]);
+            const float slope = f32(r[REGADDR::PA_SU_POLY_OFFSET_FRONT_SCALE]) / 16;
+            const float bias[3] = {units, 0.0f, slope};
+            if (!gs.depthBiasKnown || memcmp(gs.depthBias, bias, sizeof bias)) {
+                dkCmdBufSetDepthBias(R.cmd, bias[0], bias[1], bias[2]);
+                memcpy(gs.depthBias, bias, sizeof bias);
+                gs.depthBiasKnown = true;
+            }
+        }
+    }
+    if (doRaster && prim == 1) {  // points: the fixed size (a shader that writes gl_PointSize overrides it)
+        float point = float(r[REGADDR::PA_SU_POINT_SIZE] & 0xFFFF) / 8.0f;
+        point = (point == 0 ? 0.125f : point) * g_drawScale;
+        if (gs.pointSize != point) {
+            dkCmdBufSetPointSize(R.cmd, point);
+            gs.pointSize = point;
+        }
+    }
+
+    // ---- depth / stencil
+    if (doDepth) {
+        LATTE_DB_DEPTH_CONTROL dc;
+        memcpy((void*)&dc, r + REGADDR::DB_DEPTH_CONTROL, 4);
+        DkDepthStencilState ds = zeroed<DkDepthStencilState>();
+        dkDepthStencilStateDefaults(&ds);
+        ds.depthTestEnable = depth && dc.get_Z_ENABLE();
+        ds.depthWriteEnable = ds.depthTestEnable && dc.get_Z_WRITE_ENABLE();
+        ds.depthCompareOp = compare_op(uint32_t(dc.get_Z_FUNC()));
+        const bool stencil = depth && depth->fmt.stencil && dc.get_STENCIL_ENABLE();
+        ds.stencilTestEnable = stencil;
+        if (stencil) {
+            const bool separate = dc.get_BACK_STENCIL_ENABLE();
+            ds.stencilFrontFailOp = stencil_op(uint32_t(dc.get_STENCIL_FAIL_F()));
+            ds.stencilFrontDepthFailOp = stencil_op(uint32_t(dc.get_STENCIL_ZFAIL_F()));
+            ds.stencilFrontPassOp = stencil_op(uint32_t(dc.get_STENCIL_ZPASS_F()));
+            ds.stencilFrontCompareOp = compare_op(uint32_t(dc.get_STENCIL_FUNC_F()));
+            ds.stencilBackFailOp = stencil_op(uint32_t(separate ? dc.get_STENCIL_FAIL_B() : dc.get_STENCIL_FAIL_F()));
+            ds.stencilBackDepthFailOp = stencil_op(uint32_t(separate ? dc.get_STENCIL_ZFAIL_B() : dc.get_STENCIL_ZFAIL_F()));
+            ds.stencilBackPassOp = stencil_op(uint32_t(separate ? dc.get_STENCIL_ZPASS_B() : dc.get_STENCIL_ZPASS_F()));
+            ds.stencilBackCompareOp = compare_op(uint32_t(separate ? dc.get_STENCIL_FUNC_B() : dc.get_STENCIL_FUNC_F()));
+            // DB_STENCILREFMASK: ref (bits 0-7), compare mask (8-15), write mask (16-23)
+            const uint32_t f = r[REGADDR::DB_STENCILREFMASK], b = separate ? r[REGADDR::DB_STENCILREFMASK_BF] : f;
+            if (!gs.stencilKnown || gs.stencil[0] != f || gs.stencil[1] != b) {
+                dkCmdBufSetStencil(R.cmd, DkFace_Front, uint8_t(f >> 16), uint8_t(f), uint8_t(f >> 8));
+                dkCmdBufSetStencil(R.cmd, DkFace_Back, uint8_t(b >> 16), uint8_t(b), uint8_t(b >> 8));
+                gs.stencil[0] = f;
+                gs.stencil[1] = b;
+                gs.stencilKnown = true;
+            }
+        }
+        if (!gs.depthStencilKnown || !same_bytes(gs.depthStencil, ds)) {
+            dkCmdBufBindDepthStencilState(R.cmd, &ds);
+            gs.depthStencil = ds;
+            gs.depthStencilKnown = true;
+        }
+    }
+
+    // ---- color output: blending (float targets only), write masks, logic op, blend constant
+    if (doColor) {
+        DkColorState cs = zeroed<DkColorState>();
+        dkColorStateDefaults(&cs);
+        DkColorWriteState cw = zeroed<DkColorWriteState>();
+        cw.masks = 0;
+        bool constantColor = false;
+        for (uint32_t i = 0; i < 8; i++) {
+            if (!colors[i]) continue;  // (a gap: mask 0)
+            uint32_t mask = (r[REGADDR::CB_TARGET_MASK] >> (4 * i)) & 15;
+            const bool on = colors[i]->fmt.kind == FormatInfo::FLOAT && ((r[REGADDR::CB_COLOR_CONTROL] >> (8 + i)) & 1);
+            if (!on) {
+                dkColorWriteStateSetMask(&cw, i, mask);
+                continue;
+            }
+            dkColorStateSetBlendEnable(&cs, i, true);
+            LATTE_CB_BLENDN_CONTROL b;
+            memcpy((void*)&b, r + REGADDR::CB_BLEND0_CONTROL + i, 4);
+            DkBlendState bs = zeroed<DkBlendState>();
+            dkBlendStateDefaults(&bs);
+            bs.srcColorBlendFactor = blend_factor(uint32_t(b.get_COLOR_SRCBLEND()));
+            bs.dstColorBlendFactor = blend_factor(uint32_t(b.get_COLOR_DSTBLEND()));
+            bs.colorBlendOp = blend_op(uint32_t(b.get_COLOR_COMB_FCN()));
+            const bool separate = b.get_SEPARATE_ALPHA_BLEND();
+            bs.srcAlphaBlendFactor = separate ? blend_factor(uint32_t(b.get_ALPHA_SRCBLEND())) : bs.srcColorBlendFactor;
+            bs.dstAlphaBlendFactor = separate ? blend_factor(uint32_t(b.get_ALPHA_DSTBLEND())) : bs.dstColorBlendFactor;
+            bs.alphaBlendOp = separate ? blend_op(uint32_t(b.get_ALPHA_COMB_FCN())) : bs.colorBlendOp;
+            for (DkBlendFactor f : {DkBlendFactor(bs.srcColorBlendFactor), DkBlendFactor(bs.dstColorBlendFactor),
+                                     DkBlendFactor(bs.srcAlphaBlendFactor), DkBlendFactor(bs.dstAlphaBlendFactor)})
+                constantColor |= constant_factor(f);
+            // separate alpha factors reach the GPU as given: deko3d is built from source with its alpha destination
+            // factor fixed (runtime/third_party/deko3d/PATCHES.md patch 1; issues #12 and #7)
+            dkColorWriteStateSetMask(&cw, i, mask);
+            if (!(gs.blendKnown & (1u << i)) || !same_bytes(gs.blend[i], bs)) {
+                dkCmdBufBindBlendStates(R.cmd, i, &bs, 1);
+                gs.blend[i] = bs;
+                gs.blendKnown |= uint8_t(1u << i);
+            }
+        }
+        const uint32_t rop = (r[REGADDR::CB_COLOR_CONTROL] >> 16) & 255;
+        if (rop != 0xCC) cs.logicOp = logic_op(rop);
+        if (!gs.colorKnown || !same_bytes(gs.color, cs)) {
+            dkCmdBufBindColorState(R.cmd, &cs);
+            gs.color = cs;
+            gs.colorKnown = true;
+        }
+        if (!gs.colorWriteKnown || gs.colorWrite.masks != cw.masks) {
+            dkCmdBufBindColorWriteState(R.cmd, &cw);
+            gs.colorWrite = cw;
+            gs.colorWriteKnown = true;
+        }
+        if (constantColor) {
+            const uint32_t* constant = r + REGADDR::CB_BLEND_RED;
+            if (!gs.blendConstKnown || memcmp(gs.blendConst, constant, sizeof gs.blendConst)) {
+                dkCmdBufSetBlendConst(R.cmd, f32(constant[0]), f32(constant[1]), f32(constant[2]), f32(constant[3]));
+                memcpy(gs.blendConst, constant, sizeof gs.blendConst);
+                gs.blendConstKnown = true;
+            }
+        }
+    }
+    const uint64_t vertexStart = timed ? now_ns() : 0;
+
+    rprof::mark(rprof::kPipeline);
+    // ---- vertex streams (guest bytes as stored; the GLSL decodes them). Vertex trimming: only the vertices
+    // from the lowest one the draw reads are copied, and the draw's base vertex moves back by as many (a
+    // model's parts share one vertex buffer and each draws its own range)
+    struct Group {
+        uint32_t index, addr, size, stride;
+        bool instance;
+        uint64_t copied;
+    };
+    Group groups[kVtxBuffers];
+    int groupCount = 0;
+    // the attribute layout: from the vertex shader's cache, or built (WWHD_DK_VTX_LAYOUT_CACHE)
+    const VertexLayout& layout = vertex_layout(r, fs, vs);
+    const DkVtxAttribState* const attribs = layout.attribs;
+    const uint32_t attribCount = layout.attribCount;
+    bool trimmable = firstVertex > 0;
+    for (int i = 0; i < layout.groupCount; i++) {
+        const VertexLayout::Group& g = layout.groups[i];
+        const uint32_t base = mmSQ_VTX_ATTRIBUTE_BLOCK_START + g.index * 7;
+        const uint32_t addr = r[base], size = r[base + 1] + 1, stride = (r[base + 2] >> 11) & 0xFFFF;
+        const uint64_t last = g.instance ? instances - 1 : maxVertex;
+        const uint64_t copied = std::min<uint64_t>(size, last * stride + std::max<uint64_t>(g.attributeEnd, stride));
+        if (!g.instance && stride && firstVertex * stride >= copied) trimmable = false;
+        groups[groupCount++] = {g.index, addr, size, stride, g.instance, copied};
+    }
+    const uint32_t trim = trimmable ? uint32_t(firstVertex) : 0;  // vertices left out of every per-vertex stream
+    DkVtxBufferState bufferStates[kVtxBuffers];
+    DkBufExtents vtx[kVtxBuffers];
+    uint32_t bufferCount = 0, vtxMask = 0;
+    for (int i = 0; i < groupCount; i++) {
+        const Group& g = groups[i];
+        const uint64_t skipBytes = g.instance ? 0 : uint64_t(trim) * g.stride;
+        rprof::UploadKind kind(rprof::kUpVertex);
+        const StreamSlice slice =
+            stream_guest(g.addr + uint32_t(skipBytes), uint32_t(std::max<uint64_t>(g.copied - skipBytes, 4)), 16);
+        if (!slice) {
+            R.perf.streamFullSkips++;
+            skip(g_drawSkips.streamFull);
+            return;
+        }
+        R.perf.vertexBytes += g.copied - skipBytes;
+        if (g_traceFrame && (g_traceDraws || g_captureDraws) && g.stride) {
+            char t[48];
+            snprintf(t, sizeof t, " vb%u@%08X stride %u:", g.index, g.addr, g.stride);
+            g_traceVertices += t;
+            const uint64_t first = g.instance ? 0 : firstVertex * g.stride;
+            for (uint64_t b = first; b < std::min<uint64_t>(first + 2ull * g.stride, g.size); b++) {
+                snprintf(t, sizeof t, "%s%02X", (b - first) % g.stride ? "" : " ",
+                         *static_cast<const uint8_t*>(ppc_ptr(g.addr + uint32_t(b))));
+                g_traceVertices += t;
+            }
+        }
+        while (bufferCount <= g.index) bufferStates[bufferCount++] = {0, 0};
+        bufferStates[g.index] = {g.stride, g.instance ? 1u : 0u};
+        vtx[g.index] = {slice.gpu, slice.size};
+        vtxMask |= 1u << g.index;
+    }
+    // (WWHD_DK_VTX_IDENTITY) the attributes bound are this layout's while it is the build they came from (a layout only
+    // changes in a new build); the buffer states are made from its groups (slots, instancing) and the strides only
+    const bool identity = g_vtxIdentity.load(std::memory_order_relaxed);
+    if (identity && gs.attribBuild == layout.build) g_res.attribSame++;
+    else if (gs.attribCount != attribCount || memcmp(gs.attribs, attribs, attribCount * sizeof(DkVtxAttribState))) {
+        dkCmdBufBindVtxAttribState(R.cmd, attribs, attribCount);
+        memcpy(gs.attribs, attribs, attribCount * sizeof(DkVtxAttribState));
+        gs.attribCount = attribCount;
+        gs.attribBuild = layout.build;
+    } else
+        gs.attribBuild = layout.build;  // (the same attributes)
+    bool stridesSame = identity && gs.bufferBuild == layout.build;
+    for (int i = 0; stridesSame && i < groupCount; i++) stridesSame = gs.bufferStrides[i] == groups[i].stride;
+    if (stridesSame) g_res.bufferStateSame++;
+    else {
+        if (gs.bufferStateCount != bufferCount ||
+            memcmp(gs.bufferStates, bufferStates, bufferCount * sizeof(DkVtxBufferState))) {
+            dkCmdBufBindVtxBufferState(R.cmd, bufferStates, bufferCount);
+            memcpy(gs.bufferStates, bufferStates, bufferCount * sizeof(DkVtxBufferState));
+            gs.bufferStateCount = bufferCount;
+        }
+        gs.bufferBuild = layout.build;
+        for (int i = 0; i < groupCount; i++) gs.bufferStrides[i] = groups[i].stride;
+    }
+    bind_runs(vtx, vtxMask, gs.vtx, gs.vtxKnown, [&](uint32_t first, const DkBufExtents* e, uint32_t n) {
+        dkCmdBufBindVtxBuffers(R.cmd, first, e, n);
+    });
+    if (timed) {
+        g_res.stateBindNs += (fixedStart - lap.at) * kDrawTimeSample;
+        g_res.stateFixedNs += (vertexStart - fixedStart) * kDrawTimeSample;
+        g_res.stateVertexNs += (now_ns() - vertexStart) * kDrawTimeSample;
+    }
+    lap(R.perf.stateNs);
+
+    rprof::mark(rprof::kVertex);
+    // ---- draw
+    if (g_shaderCodeLoaded) {  // shader code loaded mid-frame: the shader caches forget it (dk.h)
+        g_shaderCodeLoaded = false;
+        dkCmdBufBarrier(R.cmd, DkBarrier_None, DkInvalidateFlags_Shader);
+    }
+    // test (Developer options "Skip ambient occlusion"): the occlusion pass's draw is not made; its target, a mask
+    // whose red and green channels hold the occlusion (1 = none, as on open ground), gets those channels set to 1
+    // instead (the draw's own scissor, the targets already bound), so the blur and the composite see no occlusion
+    // and the real shadows (the other channels) stay. The pass's inputs are still made.
+    if (g_skipAo.load(std::memory_order_relaxed) && is_occlusion(r, false) && is_occlusion(r, true)) {
+        int slot = 0;
+        for (int i = 0; i < 8; i++)
+            if (colors[i]) {
+                slot = i;
+                break;
+            }
+        dkCmdBufClearColorFloat(R.cmd, uint32_t(slot), DkColorMask_R | DkColorMask_G, 1.0f, 1.0f, 0.0f, 0.0f);
+        static uint64_t logged = 0;
+        if (!logged++) LOG("[dk] ambient occlusion skipped: the occlusion pass's target cleared to \"none\" instead");
+        R.perf.aoSkipped++;
+    } else
+    if (indexed) {
+        const int restart = stripRestart ? 1 : 0;
+        const uint32_t hostRestart = indices.format == DkIdxFormat_Uint16 ? 0xFFFFu : 0xFFFFFFFFu;
+        if (gs.restart != restart || (restart && gs.restartIndex != hostRestart)) {
+            dkCmdBufSetPrimitiveRestart(R.cmd, restart != 0, hostRestart);
+            gs.restart = restart;
+            gs.restartIndex = hostRestart;
+        }
+        if (gs.indexAddr != indices.slice.gpu || gs.indexFormat != indices.format) {
+            dkCmdBufBindIdxBuffer(R.cmd, DkIdxFormat(indices.format), indices.slice.gpu);
+            gs.indexAddr = indices.slice.gpu;
+            gs.indexFormat = indices.format;
+        }
+        dkCmdBufDrawIndexed(R.cmd, mode, indices.count, instances, 0, int32_t(baseVertex) - int32_t(trim), 0);
+    } else
+        dkCmdBufDraw(R.cmd, mode, count, instances, baseVertex - trim, 0);
+    lap(R.perf.submitNs);
+    rprof::mark(rprof::kRecord);
+
+    auto tally = [&](Surface* s) {
+        if (s->drawFrame != R.frame) {
+            s->drawFrame = R.frame;
+            s->frameDraws = 0;
+        }
+        s->frameDraws++;
+    };
+    for (auto* c : colors)
+        if (c) {
+            mark_gpu_written(c);
+            tally(c);
+        }
+    if (depth) {
+        mark_gpu_written(depth);
+        tally(depth);
+    }
+    const uint32_t drawIndex = g_frameDraws++;
+    if (g_capture) capture_note_draw(drawIndex, colors, slices, depth, depthSlice);
+    if (gamepadDraw && timed) R.perf.gamepadDrawNs += (now_ns() - drawStart) * kDrawTimeSample;
+    if (g_traceFrame) {
+        trace_draw(nullptr);
+        if (g_traceDraws || g_captureDraws) {
+            LATTE_DB_DEPTH_CONTROL tdc;
+            memcpy((void*)&tdc, r + REGADDR::DB_DEPTH_CONTROL, 4);
+            LOG("[trace]   draw #%u raster: cull %s%s, front %s, viewport y %s, z %g..%g, clip %s, z clip near %s far %s",
+                drawIndex, pm.get_CULL_FRONT() ? "F" : "", pm.get_CULL_BACK() ? "B" : (pm.get_CULL_FRONT() ? "" : "none"),
+                pm.get_FRONT_FACE() == LATTE_PA_SU_SC_MODE_CNTL::E_FRONTFACE::CCW ? "ccw" : "cw",
+                f32(r[REGADDR::PA_CL_VPORT_YSCALE]) < 0 ? "down (swizzled)" : "up",
+                f32(r[REGADDR::PA_CL_VPORT_ZOFFSET]) - (clip.get_DX_CLIP_SPACE_DEF() ? 0.0f : f32(r[REGADDR::PA_CL_VPORT_ZSCALE])),
+                f32(r[REGADDR::PA_CL_VPORT_ZOFFSET]) + f32(r[REGADDR::PA_CL_VPORT_ZSCALE]),
+                clip.get_DX_CLIP_SPACE_DEF() ? "0..1" : "-1..1", clip.get_ZCLIP_NEAR_DISABLE() ? "off" : "on",
+                clip.get_ZCLIP_FAR_DISABLE() ? "off" : "on");
+            LOG("[trace]   draw #%u c0=%s d=%s vs %08X/%016llX ps %08X/%016llX prim %u count %u inst %u%s; depth %s func %u "
+                "write %u, stencil %u, poly offset %u (%g, %g), blend %08X, mask %08X, trim %u;%s",
+                drawIndex, trace_name(colors[0]).c_str(), trace_name(depth).c_str(), r[mmSQ_PGM_START_VS] << 8,
+                (unsigned long long)vs->glslHash, r[mmSQ_PGM_START_PS] << 8, (unsigned long long)ps->glslHash, prim, count,
+                instances, indexed ? (indices.format == DkIdxFormat_Uint16 ? " idx16" : " idx32") : "",
+                depth && tdc.get_Z_ENABLE() ? "on" : "off", uint32_t(tdc.get_Z_FUNC()), uint32_t(tdc.get_Z_WRITE_ENABLE()),
+                uint32_t(tdc.get_STENCIL_ENABLE()), (r[REGADDR::PA_SU_SC_MODE_CNTL] >> 11) & 1,
+                f32(r[REGADDR::PA_SU_POLY_OFFSET_FRONT_SCALE]) / 16, f32(r[REGADDR::PA_SU_POLY_OFFSET_FRONT_OFFSET]),
+                r[REGADDR::CB_BLEND0_CONTROL], r[REGADDR::CB_TARGET_MASK], trim, g_traceTextures.c_str());
+            // the remapped register constants each stage reads (as pack_uniforms copies them), as floats
+            std::string uniforms;
+            for (Shader* sh : {vs, ps}) {
+                if (!sh->dec) continue;
+                const uint32_t aluBase = mmSQ_ALU_CONSTANT0_0 + (sh->vertex ? 0x400 : 0);
+                for (const auto& e : sh->dec->list_remappedUniformEntries_register) {
+                    const uint32_t* c = r + aluBase + e.indexOffset / 4;
+                    char t[96];
+                    snprintf(t, sizeof t, " %s[%u]=(%g %g %g %g)", sh->vertex ? "vs" : "ps", e.mappedIndexOffset / 16,
+                             f32(c[0]), f32(c[1]), f32(c[2]), f32(c[3]));
+                    uniforms += t;
+                }
+                if (!sh->dec->list_remappedUniformEntries_bufferGroups.empty()) uniforms += sh->vertex ? " vs+blocks" : " ps+blocks";
+            }
+            LOG("[trace]   draw #%u uniforms%s; vertices%s", drawIndex, uniforms.c_str(), g_traceVertices.c_str());
+        }
+    }
+    g_traceTextures.clear();
+    g_traceVertices.clear();
+    R.drawCount++;
+}
+}  // namespace
+
+// ---- the trace of a frame's passes (WWHD_DK_TRACE_FRAMES / capture, backend.cpp), as gfx/gl's
+namespace {
+struct PassTrace {
+    std::string pass, last;  // the open pass's targets, the last pass's
+    uint64_t draws = 0;
+    std::vector<const Surface*> sampled;
+    void close() {
+        if (pass.empty()) return;
+        std::string s;
+        for (const Surface* t : sampled) s += " " + trace_name(t);
+        LOG("[trace] frame %llu pass %s: %llu draws, samples%s", (unsigned long long)(R.frame + 1), pass.c_str(),
+            (unsigned long long)draws, s.empty() ? " nothing" : s.c_str());
+        pass.clear();
+        draws = 0;
+        sampled.clear();
+    }
+} passTrace;
+}  // namespace
+
+std::string trace_name(const Surface* s) {
+    if (!s) return "-";
+    char b[96];
+    snprintf(b, sizeof b, "%08X:%ux%u/f%X%s%s", s->addr, s->width, s->height, s->format, s->isDepth ? "/depth" : "",
+             s->gpuWritten ? "" : "/cpu");
+    std::string n = b;
+    if (s->drcScanFrame != ~0ull) n += "/drc-" + std::to_string(R.frame - s->drcScanFrame);
+    if (s->drcScanFrame != ~0ull || s->gamepadSource)
+        n += s->readFrame == ~0ull ? "/unread" : "/read-" + std::to_string(R.frame - s->readFrame);
+    if (s->gamepadSource) n += "/gpsrc";
+    return n;
+}
+void trace_pass(const std::array<Surface*, 8>& colors, const Surface* depth) {
+    passTrace.close();
+    std::string p;
+    for (int i = 0; i < 8; i++)
+        if (colors[i]) p += " c" + std::to_string(i) + "=" + trace_name(colors[i]);
+    p += " d=" + trace_name(depth);
+    passTrace.pass = passTrace.last = p;
+}
+// a draw's textures are resolved before its targets are bound (and a new pass traced): its samples wait in
+// pending until the draw is counted, in the pass it belongs to
+void trace_draw(const Surface* sampled) {
+    static std::vector<const Surface*> pending;
+    if (sampled) {
+        if (std::find(pending.begin(), pending.end(), sampled) == pending.end()) pending.push_back(sampled);
+        return;
+    }
+    if (passTrace.pass.empty()) passTrace.pass = passTrace.last + " (continued)";
+    passTrace.draws++;
+    for (const Surface* t : pending)
+        if (std::find(passTrace.sampled.begin(), passTrace.sampled.end(), t) == passTrace.sampled.end())
+            passTrace.sampled.push_back(t);
+    pending.clear();
+}
+void trace_event(const char* fmt, ...) {
+    passTrace.close();
+    char b[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(b, sizeof b, fmt, ap);
+    va_end(ap);
+    LOG("[trace] frame %llu %s", (unsigned long long)(R.frame + 1), b);
+}
+
+}  // namespace gfxdk

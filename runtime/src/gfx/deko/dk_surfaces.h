@@ -1,0 +1,341 @@
+// The deko3d renderer's surfaces (P2, surface lane; docs/deko3d-plan.md "P2 lanes"): guest surfaces as
+// DkImages in the image heap, their views and descriptors, uploads from guest memory, render targets,
+// clears, copies, the TV scan buffer, invalidation and the sampler cache. A structural port of
+// gfx/gl/surfaces.cpp (detiling, sparse hash, GuestRanges, scan copies, internal resolution), with
+// images, views and uploads modelled on gfx/vulkan/surfaces.cpp and formats on gfx/vulkan/formats.cpp.
+//
+// Files: surfaces.cpp (this header's functions), formats.cpp (format_info, convert_row) and
+// descriptors.cpp (descriptor slots, the sampler cache). Render thread only, like everything that records.
+//
+// Contracts with the other lanes:
+// - Everything here that records commands assumes begin_commands() (dk.h) opened the frame.
+// - Commands that bind render targets or set viewports, scissors or 3D state (clears) call forget_state()
+//   (dk_draw.h) afterwards; the 2D-engine copies (dkCmdBufCopyImage / BlitImage / CopyBufferToImage) do not.
+// - upload_surface and the copies leave their results visible to the commands that follow them (their own
+//   barriers); the draw path adds none for them.
+// - Descriptor writes are recorded with dkCmdBufPushData (ordered with the commands, never written by the CPU
+//   into a descriptor the GPU may be reading); commit_descriptors() before the draw that uses them makes
+//   them visible (a DkInvalidateFlags_Descriptors barrier when anything was written since the last one).
+#pragma once
+#include <deko3d.h>
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "dk.h"
+
+namespace gfxdk {
+
+// ---- formats (formats.cpp): GX2 surface formats -> DkImageFormat, CPU conversions as gfx/vulkan's
+enum class Convert : uint8_t {
+    NONE,       // copy texels as stored
+    RGB565,     // Latte 5_6_5 -> RGBA8
+    RGBA5551,   // Latte 1_5_5_5 (R in low bits) -> RGBA8
+    ABGR1555,   // Latte 5_5_5_1 -> RGBA8
+    RGBA4,      // Latte 4_4_4_4 -> RGBA8
+    RG4,        // Latte 4_4 -> RG8
+    D24S8,      // 24-bit depth + 8-bit stencil -> ZF32_X24S8 (kept at first, plan section 3)
+    D24_R32F,   // 24-bit depth sampled as a color texture -> R32F
+    X24_8_32F,  // 32F depth + 8 stencil in 64 bits -> ZF32_X24S8
+};
+struct FormatInfo {
+    DkImageFormat image = DkImageFormat_None;  // the DkImage's format (render targets, uploads)
+    uint32_t bytesPerBlock = 0;                // guest bytes per texel or 4x4 block
+    uint32_t hostBytesPerBlock = 0;            // bytes per texel or block in the DkImage
+    bool compressed = false, depth = false, stencil = false;
+    bool srgb = false;                         // an sRGB format (the TV picture's encoding, present)
+    Convert convert = Convert::NONE;
+    enum Kind : uint8_t { FLOAT, UINT, SINT } kind = FLOAT;  // shader-visible data type
+};
+// isDepth: the surface is used as a depth buffer (selects depth formats). image None: unsupported (logged once)
+FormatInfo format_info(uint32_t gx2Format, bool isDepth);
+void convert_row(Convert c, const uint8_t* src, uint8_t* dst, uint32_t count);
+
+// ---- descriptors (descriptors.cpp). The image and sampler descriptor sets of memory.cpp are bound once
+// per frame by begin_commands. Slot ranges: images 0..kReservedImageIds-1 and samplers
+// 0..kReservedSamplerIds-1 belong to the renderer's own passes (overlay_dk.cpp: images 1-63 and sampler 0;
+// the present pass: image 0 for the game's picture, image 64 for the GamePad screen, and samplers 1-2: linear
+// and nearest, clamped). The rest belong to this lane, which allocates and recycles them; nobody else writes
+// descriptors there.
+constexpr uint32_t kReservedImageIds = 65, kReservedSamplerIds = 16;
+constexpr uint32_t kPresentImageId = 0, kPresentLinearSamplerId = 1, kPresentNearestSamplerId = 2;
+constexpr uint32_t kGamepadImageId = 64;
+// a free image descriptor slot; fatal() naming the count when the 8192 slots are used up
+uint32_t image_descriptor_alloc();
+// records the descriptor of view into slot id (dkCmdBufPushData); visible after commit_descriptors()
+void image_descriptor_write(uint32_t id, const DkImageView& view);
+// the slot is reused once the GPU has finished the frame being recorded
+void image_descriptor_free_later(uint32_t id);
+// the sampler descriptor slot for GX2 sampler words (SQ_TEX_SAMPLER_WORD0..2): cached by its words and
+// the two flags; compare: a depth-compare sampler; integer: an integer texture (nearest filtering only).
+// When the cache is full the least recently used slot that no in-flight frame uses is rewritten.
+uint32_t sampler_id(const uint32_t* samplerWords, bool compare, bool integer);
+// a sampler slot from an earlier sampler_id is used by this frame too (the draw path's texture cache): the
+// cache's eviction then leaves it alone until the GPU is done with this frame. (An eviction advances
+// R.surfaceEpoch: cached lookups of the evicted slot are redone.)
+void sampler_used(uint32_t id);
+// 16x anisotropic filtering (WWHD_ANISO, the overlay's Effects): any thread; samplers follow from the next frame
+bool aniso_enabled();
+bool bloom_enabled();
+void set_bloom(bool on);
+bool blur_enabled();
+void set_blur(bool on);
+void set_aniso(bool on);
+int aniso_level();               // 1 (off), 2, 4, 8, 16
+void set_aniso_level(int level);  // the same from the next frame; others round down
+// edge smoothing (FXAA, issue #21; WWHD_FXAA=1, the Switch tab's Picture): any thread, from the next frame
+bool fxaa_enabled();
+void set_fxaa(bool on);
+// the barrier that makes this frame's descriptor writes visible (nothing when none since the last one)
+void commit_descriptors();
+// the image descriptor of a 1x1 transparent black texture (shaders sampling a unit that has no surface)
+uint32_t null_image_id();
+struct DescriptorStats {
+    uint32_t imagesUsed = 0, samplersUsed = 0;  // slots in use now
+    uint64_t imageWrites = 0, samplerWrites = 0, samplerHits = 0, samplerEvictions = 0;
+};
+DescriptorStats descriptor_stats_take();
+
+// ---- surfaces (surfaces.cpp)
+struct GuestLayout;  // address-library geometry of each mip level (surfaces.cpp)
+struct SurfaceDesc {
+    uint32_t addr = 0, mipAddr = 0, width = 0, height = 0, slices = 1, pitch = 0, mips = 1, format = 0, dim = 1,
+             tileMode = 0, swizzle = 0;
+    bool isDepth = false;
+};
+// a DkImage in the image heap with the descriptor of each view that draws sampled
+struct SurfaceImage {
+    DkImage image{};
+    DkImageLayout layout{};
+    ImageAlloc mem;               // memory.cpp: freed with image_free_later
+    bool valid = false;           // image initialized
+    DkImageType type = DkImageType_2D;
+    uint32_t pw = 0, ph = 0;      // pixels (the guest size times the surface's scale)
+    uint32_t layers = 1;          // array layers (1 for 3D: depth is `slices`)
+    uint32_t flags = 0;           // its DkImageFlags and format (an image kept for a rescale is reused only with
+    DkImageFormat format = DkImageFormat_None;  // the same)
+    uint32_t imageId = 0;         // descriptor of the default view (all mips and layers, identity swizzle); 0: none
+    // sampled views by (view type, format, swizzle, first mip, mip count) key: their descriptor slots
+    std::unordered_map<uint64_t, uint32_t> views;
+};
+struct Surface {
+    SurfaceImage img;
+    // the guest's description (as gfx/gl's)
+    uint32_t addr = 0, mipAddr = 0, width = 0, height = 0, slices = 1, pitch = 0, mips = 1, format = 0, dim = 1,
+             tileMode = 0, swizzle = 0;
+    bool isDepth = false, gpuWritten = false, dirty = true;
+    uint64_t writeSeq = 0, contentHash = 0, lastCheckedFrame = ~0ull, sparseHash = 0;
+    // writes (new writeSeq values) to any surface at its address: one counter shared by them all (S.addrWrites).
+    // Which of several surfaces at one address a texture lookup finds depends on their writeSeq order, so the
+    // draw path keeps such a lookup while this is unchanged (WWHD_DK_TEX_SHARED_CACHE). Null for private copies.
+    uint64_t* addrWrites = nullptr;
+    uint64_t changedFrame = 0;   // the last frame its guest data was uploaded (upload_surface)
+    // texture eviction (issue #11, surfaces.cpp): the recording frame of its last lookup or sampling draw; evicted:
+    // its image, views and descriptors were freed (a texture made again from guest memory at its next lookup)
+    uint64_t useFrame = 0;
+    bool evicted = false;
+    uint64_t drawFrame = ~0ull;  // the last frame a draw rendered to it, and how many draws did
+    uint32_t frameDraws = 0;
+    // the GamePad picture (gamepad_only, dk_draw.h), as gfx/gl's
+    uint64_t drcScanFrame = ~0ull, tvScanFrame = ~0ull, readFrame = ~0ull;
+    bool gamepadSource = false;
+    uint64_t gamepadSourceSince = ~0ull;
+    uint64_t drcCopyFrame = 0;  // a GamePad scan copy (S.drcScan): the frame of its last copy
+    bool tvShared = false;
+    bool skipLogged = false;
+    Surface* derivedFrom = nullptr;
+    uint32_t dataSize = 0;
+    // internal resolution: the image has img.pw x img.ph pixels for the guest's width x height. Only
+    // screen-shaped render targets get a scale other than 1 (P3); lookups and guest memory keep the guest size.
+    float scale = 1.0f;
+    bool renderTarget = false;  // created or used as a render target
+    bool scalable = false;      // screen-shaped: takes res_scale() as a render target
+    bool hudFull = false;       // the TV picture's buffer at full resolution for the HUD (draw.cpp)
+    // (TP HD) read since its last draw with a depth buffer: the HUD switch's condition (draw.cpp; TP HD's shadow
+    // passes between the scene's 3D draws read nothing and are not the HUD)
+    bool readAfterScene = false;
+    SurfaceImage twin;          // the TV picture's other image (scaled scene / full-resolution HUD)
+    float twinScale = 0;
+    // GPU ordering (dk_sync.h): the barrier epoch of its last GPU read (sampled by a draw) and write (a draw
+    // or clear rendered it); 0: none
+    uint64_t syncRead = 0, syncWrite = 0;
+    bool writebackPending = false;  // a CPU-read surface written since the last guest_writeback
+    FormatInfo fmt;
+    std::shared_ptr<GuestLayout> guest;
+};
+
+// every surface, by address and as a list (surfaces.cpp); the TV scan buffer state (copy_to_scan)
+struct SurfaceSet {
+    std::unordered_multimap<uint32_t, std::unique_ptr<Surface>> byAddr;
+    std::unordered_map<uint32_t, uint64_t> addrWrites;  // Surface::addrWrites (node-based: the pointers stay valid)
+    std::vector<Surface*> list;
+    std::unique_ptr<Surface> tvScan;
+    std::unique_ptr<Surface> drcScan;  // the GamePad picture's copy, while it is drawn (gfxsw::gamepad_picture_drawn)
+    Surface* tvSource = nullptr;  // the buffer last copied to the TV scan buffer
+    Surface* drcSource = nullptr; // the buffer last copied to the GamePad's (drcScan)
+    Surface* scanSrc = nullptr;   // ... while its copy is not made yet (present reads it directly)
+};
+extern SurfaceSet S;
+
+uint64_t next_write_seq();
+// s was written (by the GPU, an upload or a copy): its new place in the write order
+inline void note_write(Surface* s) {
+    s->writeSeq = next_write_seq();
+    if (s->addrWrites) ++*s->addrWrites;
+}
+// Color surfaces with linear tiling are read by the game's CPU: the Picto Box copies the picture it keeps
+// (GX2CopySurface, caller 027B6BCC) into a linear-special surface and the album takes the pixels from guest memory
+// (black, with leftover lines, while nothing wrote them there); its 800x450 linear-aligned target is the other one.
+// Cemu reads linear targets back too. What the GPU wrote into them goes to guest memory at the next GX2DrawDone, or
+// before GX2CopySurface returns for a copy's destination: guest_writeback, which waits for the GPU (only then).
+// Tile modes: 1 linear-aligned (a render target's and a surface's), 16 GX2's linear-special (a surface's)
+inline bool cpu_read_surface(const Surface* s) {
+    return (s->tileMode == 1 || s->tileMode == 16) && !s->isDepth && s->addr;  // (not a private copy)
+}
+void queue_guest_writeback(Surface* s);
+void guest_writeback();
+inline void mark_gpu_written(Surface* s) {
+    if (!s->gpuWritten) {
+        s->gpuWritten = true;
+        R.surfaceEpoch++;
+    }
+    note_write(s);
+    if (!s->writebackPending && cpu_read_surface(s)) queue_guest_writeback(s);
+}
+// s is read by something other than the GamePad picture (gamepad_only)
+inline void note_read(Surface* s) {
+    s->readFrame = R.frame;
+    s->readAfterScene = true;
+    if (s->gamepadSource && R.frame > s->gamepadSourceSince) s->tvShared = true;
+    if (s->derivedFrom) {
+        s->derivedFrom->readFrame = R.frame;
+        s->derivedFrom->readAfterScene = true;
+    }
+}
+// the TV picture: GX2CopyColorBufferToScanBuffer only notes its buffer; presenting reads that buffer unless
+// something writes to it first: scan_flush makes the copy then
+void scan_flush();
+// the buffer of the picture the window shows: the GamePad's while it is the one presented (Off-TV Play, the default),
+// else the TV's. Its HUD is where FXAA and the full-resolution HUD switch apply (draw.cpp)
+Surface* shown_source();
+void copy_scan(Surface* src, std::unique_ptr<Surface>& scan);  // src into a scan copy (made to fit)
+inline void before_write(const Surface* s) {
+    if (s && s == S.scanSrc) scan_flush();
+}
+
+// RGBA8 with and without the sRGB bit describe the same memory, as on the GPU: one surface (one image), whose views
+// take the other format where the registers or texture words ask for it. The Picto Box clears its 800x450 picture
+// as RGBA8, draws it through an sRGB view, writes alpha through the RGBA8 one and copies that to the album.
+inline bool srgb_twins(uint32_t a, uint32_t b) { return (a ^ b) == 0x400 && (a & 0x3F) == 0x1A; }
+Surface* find_or_create_surface(const SurfaceDesc& d, bool forRendering);
+// the render targets the registers describe (CB_COLORn_*, DB_*), created when new; *slice: the layer
+// srgbView: the registers ask for the surface's sRGB twin format (srgb_twins): its views take that format
+Surface* color_target(const uint32_t* regs, int i, uint32_t* slice, bool* srgbView = nullptr);
+Surface* depth_target(const uint32_t* regs, uint32_t* slice);
+Surface* surface_from_color_buffer(uint32_t addr, uint32_t* firstSlice = nullptr, uint32_t* numSlices = nullptr);
+Surface* surface_from_depth_buffer(uint32_t addr, uint32_t* firstSlice = nullptr, uint32_t* numSlices = nullptr);
+// the surface a texture unit's 7 SQ_TEX_RESOURCE words describe (created and uploaded when new); unique:
+// whether it is the only surface at its address (a cached lookup then depends only on the words)
+Surface* sampled_texture(const uint32_t* texWords, bool isDepthSampler, bool* unique = nullptr);
+// guest memory -> image when the guest data changed (checked once per frame; dirty, sparse hash): stream
+// slice + dkCmdBufCopyBufferToImage per level and layer, then the barrier that orders it before later use
+void upload_surface(Surface* s);
+// the image descriptor slot of the view the texture words select (dimension, format, swizzle, mips)
+uint32_t sampled_view_id(Surface* s, const uint32_t* texWords);
+// a view of one level/layer of the surface's image for dkCmdBufBindRenderTargets (draw.cpp, clears)
+// (srgbView: in the sRGB twin of the surface's format, srgb_twins)
+void target_view(Surface* s, uint32_t level, uint32_t layer, DkImageView* out, bool srgbView = false);
+void create_surface_image(Surface* s);   // the image at the surface's scale (and its default descriptor)
+void destroy_surface_image(Surface* s);  // image memory and descriptors freed once the GPU is done
+// a snapshot of a surface the draw also renders to (sampling a bound target is undefined): a copy made
+// when the surface was written since the last one
+Surface* feedback_copy(Surface* s);
+// the surface a draw samples for texture words that ask for a 3D texture: s itself, or for a layered render
+// target (a 3D color buffer is drawn slice by slice into layers: deko3d renders into no 3D image) a 3D copy of
+// its layers, made again when the layers were written since the last one (the Picto Box's colour table)
+Surface* volume_source(Surface* s, const uint32_t* texWords);
+// the surface a draw samples for texture words that ask for more levels than a render target s has: a copy
+// with the mip chain, its levels the game's own rendered ones (GPU-written surfaces at the descriptor's mip
+// addresses: the bloom chain, the light buffer) or else s halved; made again when one of them was written.
+// As gfx/vulkan's with_mip_chain (upstream e40b7e6, after GreenNaugahyde/ZeldaWWHDRecompAndroid 73b54e1);
+// The bloom's chain and the distance blur's are the Switch tab's options (bloom_enabled, blur_enabled); off, s itself
+// (issue #15: the bloom read only level 0). WWHD_NO_RT_MIPS=1: no chains at all.
+// Only the levels the sampler's LOD clamp lets it read are brought up to date (and the ones they are halved from).
+// A draw that renders into one of the levels its sampler can read gets s itself, as before the chains: the game's
+// depth reduction renders level 1 of F40E8000 sampling that texture with the LOD clamped to 1, which the one-level
+// target answers with level 0; read from the chain, level 1 would be made from itself and keep old depths (shadows
+// darkening while the camera turns, issue #15).
+Surface* mip_chain(Surface* s, const uint32_t* texWords, const uint32_t* samplerWords, Surface* const* targets,
+                   size_t numTargets);
+// copy (scaled) between two surfaces' levels/layers; depth always through dkCmdBufBlitImage (plan section 3)
+void blit(Surface* src, uint32_t srcLevel, uint32_t srcLayer, uint32_t sw, uint32_t sh, Surface* dst,
+          uint32_t dstLevel, uint32_t dstLayer, uint32_t dw, uint32_t dh);
+
+// ---- GX2 operations (render::Backend entries)
+void clear_color(const uint32_t* regs, uint32_t colorBuffer, const float rgba[4]);
+void clear_depth_stencil(const uint32_t* regs, uint32_t depthBuffer, float depth, uint32_t stencil, uint32_t flags);
+void copy_surface(uint32_t src, uint32_t srcMip, uint32_t srcSlice, uint32_t dst, uint32_t dstMip, uint32_t dstSlice);
+void copy_to_scan(uint32_t colorBuffer, uint32_t target);  // target 1: TV, else the GamePad
+// (TP HD fork) depth peeks (peekz.cpp): p = depth image, then (x, y in 1/65536ths, result address) per point. The
+// pixels are copied in this frame's commands; the answers are published once its fence has signalled.
+void peek_z(const uint32_t* p, uint32_t n);
+void invalidate(uint32_t flags, uint32_t addr, uint32_t size);
+void ss_reset_surfaces();  // a save state was loaded: every surface re-read from guest memory
+
+// ---- presentation (backend.cpp's present pass samples the game's picture)
+struct PresentSource {
+    Surface* surface = nullptr;  // null: no picture yet (the present pass shows the background)
+    uint32_t imageId = kPresentImageId;  // its default view's descriptor, written into the reserved slot
+    uint32_t pw = 0, ph = 0;             // the image's pixels
+    uint32_t width = 0, height = 0;      // the guest's size
+    bool srgb = false;                   // an sRGB format: present encodes as R.tvSrgb says
+};
+// the TV picture to present: the scan buffer, or the noted buffer itself when nothing wrote to it since the
+// game copied it (gfx/gl present); writes its view into kPresentImageId (commit_descriptors() follows)
+PresentSource present_source();
+// the GamePad picture to show (gfxsw::gamepad_view), in kGamepadImageId; none while it is not drawn
+PresentSource gamepad_source();
+
+// ---- internal resolution (gfx/gl's, surfaces.cpp): screen-shaped render targets get res_scale() x their guest
+// size (WWHD_RES_SCALE, 0.5..2; dynamic resolution, backend.cpp, lowers it while the GPU is the limit)
+inline uint32_t scaled_size(uint32_t v, float scale) {
+    return scale == 1.0f ? v : std::max<uint32_t>(1, uint32_t(v * scale + 0.99f));
+}
+float res_scale();                // the factor render targets get this frame (render thread)
+float requested_res_scale();      // the factor asked for (any thread)
+float res_scale_shown();          // the factor in use, for the settings overlay (any thread)
+void set_res_scale(float scale);  // from the next frame on (any thread)
+// the shadow maps' own factor (test, 0.5 / 1 / 2): the three 1024x1024 depth maps are rendered at this x their guest
+// size; sampling is normalized, so the shaders need nothing else
+float shadow_scale();             // any thread: the factor asked for
+void set_shadow_scale(float scale);
+void latch_res_scale();           // present: apply a requested change; the frame's allocation budget
+void rescale_surface(Surface* s, float scale, bool keepContents, bool keepOld = false);
+// a render target about to be written: the scale it should have unless that needs a new image and this
+// frame's allocations are used up (false: still at its old scale); force: in any case
+bool fit_scale(Surface* s, bool keepContents, bool force = false);
+// fit_scale would leave s as it is (its scale is the one it should have now): draw.cpp's target memo (WWHD_DK_TARGET_MEMO2)
+bool scale_settled(const Surface* s);
+// FXAA on the TV picture's scene before the HUD is drawn into it (draw.cpp's HUD switch, issue #21): at a lower
+// internal resolution the scene goes to the full-size image through FXAA instead of the 2D engine's upscale; at
+// full resolution it goes through FXAA into a kept image of the same size, which takes the buffer's place.
+// Once a frame; false when it did not run (the shader did not load, or out of memory: the scene as it was)
+bool fxaa_scene(Surface* tv);
+// one FXAA pass (backend.cpp): src sampled at its own grid, drawn over all of dst; linear: the samples are linear
+// light. Forgets the draw state (forget_state)
+bool fxaa_pass(const SurfaceImage& src, const SurfaceImage& dst, bool linear);
+size_t rescale_pool_bytes();      // images a rescale let go, kept for the next one (stats)
+
+// once per frame from begin_commands: retire freed descriptor slots and images the GPU is done with
+void surfaces_frame_start();
+// image heap bytes of all surfaces (stats): total, render targets, surface count
+void surface_memory(size_t& total, size_t& targets, size_t& count);
+// (this fork, #37) surfaces ever created (their bookkeeping stays after eviction), for the [mem] line
+size_t surface_structs();
+
+}  // namespace gfxdk

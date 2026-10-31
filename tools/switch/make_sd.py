@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+"""Twilight Princess HD for the Switch (a fork of SwitchWakerHD): build the game from your own dump and lay
+out an SD card folder.
+
+No game files, code or keys come with this repository. This script does every step on your computer, from
+your own legally dumped copy (Twilight Princess HD, the USA disc, title 00050000-1019E500, version 81 / Rev 2,
+without the update or DLC):
+
+  1. takes the extracted game folder (or unpacks a Cemu .wua archive into build/sd-game/);
+  2. checks that code/Zelda.rpx is the version the port is made for;
+  3. translates the game's PowerPC code to C (tools/recomp/recomp.py -> build/gen/);
+  4. builds the Switch homebrew in the devkitPro container (tools/switch/build.sh -> build/switch-dk/wwhd.nro);
+  5. writes OUT/switch/tphd/ (tphd.nro and game/): copy OUT's contents to the root
+     of the SD card.
+
+usage:
+  make_sd.py --wua GAME.wua [--out DIR]       a Cemu Wii U archive (no keys; needs: pip install zstandard)
+  make_sd.py --game-dir EXTRACTED [--out DIR] a folder with code/, content/, meta/ (e.g. from Cemu's
+                                              mlc01/usr/title/00050000/1019e500, without the update)
+  The graphics (shadercache_dksh.bin) are prepared by default: from this release's shader template, downloaded
+  from its GitHub release (shader-template.sealed: shader states without game code, opened with your dump's files;
+  none there, or offline: the console compiles them as it always did).
+  options: --shaders FILE                     prepare them from FILE instead: the release's template downloaded by
+                                              hand, or your console's shader manifest (sdmc:/switch/tphd/
+                                              shader_manifest.bin, after playing a while): the shaders in it, and
+                                              guesses for the places not in it (a shadercache_gl.bin is still
+                                              accepted: its sources only)
+           --no-shaders                       do not prepare them (the console compiles them)
+           --jobs N                           parallel compiles (each needs ~1.5 GB of memory)
+           --guest-mod PACKAGE                a code mod (Mod SDK v2) built into the NRO: its id in the mod catalogue
+                                              (downloaded, e.g. gc-minimap), its .zip or its folder; repeat for
+                                              more (tools/switch/guest_mods.py)
+           --gc-game PATH                     your GameCube Wind Waker (.iso/.gcm/.rvz or extracted), for mods
+                                              whose setup reads it (the GameCube sea minimap)
+           --mod-option ID.KEY=VALUE          a mod's option (e.g. gc-minimap.size=260); repeat for more
+
+Needs Python 3 and Docker or Podman, or a native devkitPro (Windows: README.md, "What you need").
+What it makes contains the game: it is for your own console only; do not share it.
+"""
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+sys.dont_write_bytecode = True
+ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+sys.path.insert(0, os.path.join(ROOT, "tools", "installer"))
+import setup  # noqa: E402  (the desktop installer's game checks: same title, same version)
+sys.path.insert(0, os.path.join(ROOT, "tools", "switch"))
+import game_files  # noqa: E402  (content/ against the build's list)
+
+
+def fail(msg):
+    sys.exit("\nmake_sd: " + msg)
+
+
+def step(n, text):
+    print("\n[%d/5] %s" % (n, text), flush=True)
+
+
+def run(cmd, env=None, ok=(0,)):
+    print("  $ " + " ".join(cmd), flush=True)
+    rc = subprocess.call(cmd, cwd=ROOT, env=env)
+    if rc not in ok:
+        # (a Windows program that cannot start, e.g. a missing DLL, exits with 0xC0000135 and prints nothing)
+        fail("this step failed (exit code %s; see the messages above)" % (hex(rc & 0xFFFFFFFF) if rc < 0 or rc > 255 else rc))
+
+
+# the shader cache's code budget: the console loads it whole into its 64 MiB of shader code memory (gfx/deko/dk.h),
+# and what it compiles later goes there too (tools/switch/dksh_cache build). A whole game harvested on the console took
+# 14 MiB: 24 MiB stay free.
+SHADER_CODE_MIB = "40"
+
+
+def release_tag():
+    """this source's release tag: cmake/version.txt in a release zip (git archive fills it in: "v0.4.8"; "v0.4.7-55-g..."
+    in an archive of a later commit), else the newest v* tag before this commit (a git checkout); "" when unknown"""
+    import re
+    try:
+        with open(os.path.join(ROOT, "cmake", "version.txt")) as f:
+            line = f.readline().strip()
+    except OSError:
+        line = ""
+    if line.startswith("$Format") or not line:
+        try:
+            line = subprocess.run(["git", "-C", ROOT, "describe", "--tags", "--match", "v[0-9]*", "--abbrev=0"],
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True).stdout.strip()
+        except OSError:
+            line = ""
+    m = re.match(r"v\d+\.\d+\.\d+", line)
+    return m.group(0) if m else ""
+
+
+def release_template():
+    """this release's shader template (issue #88): shader-template.sealed of its GitHub release, checked against its
+    .sha256 and kept in build/; None (with a note) when there is none or it cannot be downloaded: the console then
+    compiles the graphics itself"""
+    import hashlib
+    import guest_mods
+    tag = release_tag()
+    if not tag:
+        print("  (no release version known: the graphics are not prepared; --shaders FILE to give a template)")
+        return None
+    out = os.path.join(ROOT, "build", "shader-template-%s.sealed" % tag)
+    if os.path.isfile(out):
+        return out
+    url = "https://github.com/centollOS/SwitchWakerHD/releases/download/%s/shader-template.sealed" % tag
+    try:
+        data = guest_mods.fetch(url, 64 << 20)
+        want = guest_mods.fetch(url + ".sha256", 4096).decode("ascii", "replace").split()[0].lower()
+    except (guest_mods.Fail, IndexError) as e:
+        print("  (no graphics template for %s: %s; the console compiles the graphics as you play)" % (tag, e))
+        return None
+    if hashlib.sha256(data).hexdigest() != want:
+        print("  (the downloaded graphics template does not match its .sha256: not used)")
+        return None
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "wb") as f:
+        f.write(data)
+    print("  graphics template of %s: %s" % (tag, out))
+    return out
+
+
+def shader_cache(src, game):
+    """build/shadercache_dksh.bin from the console's shader manifest (docs/shader-cache-from-dump-plan.md) or a
+    shadercache_gl.bin. The files in build/shader-cache/ hold game code: they stay on this computer."""
+    out = os.path.join(ROOT, "build", "shadercache_dksh.bin")
+    # natively when CMake, Ninja and a C++ compiler are there (on Windows devkitPro's MSYS2 ones: INSTALL.md), else in
+    # a container (tools/switch/dksh_cache/build.sh)
+    env = dict(os.environ)
+    shell = native_shell(env) if os.name == "nt" else ["bash"]
+    tool = shell + [os.path.join("tools", "switch", "dksh_cache", "build.sh")]
+    with open(src, "rb") as f:
+        head = f.read(8)
+    template = head in (b"WSME0001", b"WWHT0003")  # the release's sealed template, or one opened (issue #88)
+    if head[:4] != b"WSM1" and not template:
+        run(tool + ["build", src, out], env=env)
+        return out
+    work = os.path.join(ROOT, "build", "shader-cache")
+    os.makedirs(work, exist_ok=True)
+    m, programs, gl = (os.path.join(work, n) for n in ("manifest.bin", "programs.bin", "shadercache_gl.bin"))
+    script = os.path.join(ROOT, "tools", "switch", "shader_manifest.py")
+    if template:
+        # the template's states with the dump's programs: a manifest as the console writes it, then as below
+        recorded = os.path.join(work, "template_manifest.bin")
+        run([sys.executable, "-I", script, "from-template", src, game, recorded, programs])
+        src = recorded
+    run([sys.executable, "-I", script, "speculate", src, game, m, programs])
+    # (2: a few variants failed: speculative ones whose guessed state does not fit their program)
+    run(tool + ["translate", m, programs, gl], env=env, ok=(0, 2))
+    run(tool + ["build", gl, out, SHADER_CODE_MIB], env=env, ok=(0, 2))
+    return out
+
+
+# Native build (no Docker/Podman): used when neither is installed, and on Windows whenever devkitPro is there (issue
+# #22: Docker from devkitPro's MSYS2 bash got its container paths rewritten). On Windows it needs a devkitPro install
+# (C:/devkitPro, https://devkitpro.org) with: pacman -S switch-dev deko3d uam switch-lz4 switch-zlib switch-cmake cmake make
+def find_devkitpro_win():
+    """C:/devkitPro (devkitPro's default), or X:/devkitPro on another fixed drive when it was installed there"""
+    if os.name != "nt":
+        return "C:/devkitPro"
+    import string
+    for letter in "C" + string.ascii_uppercase.replace("C", ""):
+        root = letter + ":/devkitPro"
+        if os.path.isfile(root + "/msys2/usr/bin/bash.exe"):
+            return root
+    return "C:/devkitPro"
+
+
+DKP_WIN = find_devkitpro_win()
+
+
+def have_container_engine():
+    return bool(shutil.which("docker") or shutil.which("podman"))
+
+
+def native_toolchain_ok():
+    if os.name == "nt":
+        return os.path.isdir(DKP_WIN + "/devkitA64") and os.path.isfile(DKP_WIN + "/msys2/usr/bin/bash.exe")
+    return bool(os.environ.get("DEVKITPRO"))
+
+
+def native_shell(env):
+    """argv prefix that runs build.sh with devkitPro's own bash. On Windows a plain `bash` may be WSL's, so
+    devkitPro's MSYS2 bash is used, with DEVKITPRO as MSYS2 sees it."""
+    if os.name != "nt":
+        return ["bash"]
+    env["DEVKITPRO"] = "/opt/devkitpro"
+    env["CHERE_INVOKING"] = "1"  # stay in the repository folder
+    env["MSYS2_PATH_TYPE"] = "inherit"  # keep the Windows PATH
+    return [DKP_WIN + "/msys2/usr/bin/bash.exe", "-l"]
+
+
+def extract_wua(archive):
+    try:
+        import zstandard  # noqa: F401
+    except ImportError:
+        fail("extracting a .wua needs zstandard: python -m pip install zstandard")
+    dst = os.path.join(ROOT, "build", "sd-game")
+    tmp = dst + ".partial"
+    shutil.rmtree(tmp, ignore_errors=True)
+    run([sys.executable, "-I", os.path.join(ROOT, "tools", "wuaextract.py"), archive, "extract", tmp])
+    if not setup.valid_game_folder(tmp):
+        fail("the extracted files are incomplete (no code/Zelda.rpx, content/ or meta/meta.xml)")
+    shutil.rmtree(dst, ignore_errors=True)
+    os.replace(tmp, dst)
+    return dst
+
+
+def forwarder(args, out, icon=None):
+    """Native build, last step: the HOME-screen icon (forwarder .nsp, tools/switch/forwarder). It needs the user's
+    own prod.keys, so without them it is skipped; it never fails the build, since the game does not need it."""
+    print("\n[+] HOME-screen forwarder (optional)", flush=True)
+    keys = os.path.abspath(args.keys or os.path.join(os.path.expanduser("~"), ".switch", "prod.keys"))
+    if not os.path.isfile(keys):
+        print("  skipped: no prod.keys at %s. For the .nsp that puts an icon on the HOME screen, put your console's "
+              "prod.keys there (or use --keys PATH, outside this folder), then run: python "
+              "tools/switch/forwarder/build_forwarder_windows.py --sd \"%s\"" % (keys, out))
+    else:
+        cmd = [sys.executable, "-I", os.path.join(ROOT, "tools", "switch", "forwarder",
+                                                  "build_forwarder_windows.py"),
+               "--keys", keys, "--sd", out]
+        if icon:
+            cmd += ["--icon", os.path.abspath(icon)]
+        if subprocess.call(cmd, cwd=ROOT) != 0:
+            print("  WARNING: the forwarder was not built (see above); tphd.nro and the SD folder are fine.", flush=True)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    src = ap.add_mutually_exclusive_group()
+    src.add_argument("--wua", help="a Cemu Wii U archive (.wua; no keys needed)")
+    src.add_argument("--game-dir", help="an extracted game folder (code/, content/, meta/)")
+    ap.add_argument("--out", default=os.path.join(ROOT, "build", "sd"), help="where the SD card folder goes")
+    ap.add_argument("--shaders", help="prepare the graphics from this file (the release's shader-template.sealed, your "
+                                      "console's shader_manifest.bin or a shadercache_gl.bin) instead of the release's "
+                                      "template, downloaded by default")
+    ap.add_argument("--no-shaders", action="store_true", help="do not prepare the graphics (the console compiles them)")
+    ap.add_argument("--jobs", type=int, help="parallel compiles")
+    ap.add_argument("--keys", help="native build: your console's prod.keys, for the HOME-screen forwarder "
+                    "(default: .switch\\prod.keys in your user folder; without it the forwarder is skipped)")
+    ap.add_argument("--icon", help="custom icon (TGA, PNG, JPG) for the NRO and forwarder (default: the title-screen "
+                    "logo from the game's files, else its meta/iconTex.tga)")
+    ap.add_argument("--no-forwarder", action="store_true", help="native build: do not build the forwarder (.nsp)")
+    ap.add_argument("--name", help="custom display name for the NRO (default: Twilight Princess HD)")
+    ap.add_argument("--guest-mod", action="append", default=[], help="a code mod built into the NRO (catalogue id, .zip or folder)")
+    ap.add_argument("--gc-game", help="your GameCube Wind Waker, for mods whose setup reads it")
+    ap.add_argument("--mod-option", action="append", default=[], help="a mod's option: ID.KEY=VALUE")
+    args = ap.parse_args()
+    if not (args.wua or args.game_dir):
+        ap.error("one of --game-dir or --wua is required")
+    if args.guest_mod or args.gc_game or args.mod_option:
+        fail("--guest-mod, --gc-game and --mod-option are for SwitchWakerHD's Wind Waker code mods, not this port")
+    # WWHD_NATIVE=1 (build.sh's switch; the macOS and Linux installers set it): native even with docker/podman around
+    native = (not have_container_engine() or (os.name == "nt" and native_toolchain_ok()) or
+              os.environ.get("WWHD_NATIVE") == "1")
+    if native:
+        if not native_toolchain_ok():
+            fail("Docker or Podman is needed (the Switch toolchain runs in the devkitpro/devkita64 image), or "
+                 "a native devkitPro with the Switch libraries: see README.md, \"What you need\"")
+
+    # a mod's .zip or folder, or a catalogue id (guest_mods.py downloads it)
+    mods = [os.path.abspath(p) if os.path.exists(p) else p for p in args.guest_mod]
+    if args.guest_mod:  # what would stop the mods' step, found before the slow ones (the game files)
+        run([sys.executable, "-I", os.path.join(ROOT, "tools", "switch", "guest_mods.py"), "--check"] +
+            mods +
+            (["--gc-game", os.path.abspath(args.gc_game)] if args.gc_game else []))
+    elif args.mod_option or args.gc_game:
+        fail("--mod-option and --gc-game go with --guest-mod")
+
+    step(1, "the game files")
+    if args.wua:
+        game = extract_wua(os.path.abspath(args.wua))
+    else:
+        game = os.path.abspath(args.game_dir)
+    if not setup.valid_game_folder(game):
+        fail("%s is not an extracted game (code/Zelda.rpx, content/, meta/meta.xml)" % game)
+    print("  " + game)
+
+    # the icon of the NRO and forwarder: --icon, else made from the game's files (forwarder/make_icon.py: the
+    # title-screen logo over the boot screen, else meta/iconTex.tga)
+    if not args.icon and not os.path.isfile(os.path.join(game, "meta", "bootTvTex.tga")) \
+            and not os.path.isfile(os.path.join(game, "meta", "iconTex.tga")):
+        print("  WARNING: no bootTvTex.tga or iconTex.tga in %s" % os.path.join(game, "meta"))
+        print("  For the HOME screen icon, use --icon with an image,")
+        print("  e.g. iconTex.tga from your Cemu mlc01 folder: --icon <mlc01/usr/title/.../meta/iconTex.tga>")
+        print("  Or the NRO/forwarder will use a default icon.")
+
+    step(2, "checking the game version and files")
+    try:
+        build = setup.check_game_version(game)
+    except setup.SetupError as e:
+        fail(str(e))
+    print("  Twilight Princess HD (%s), version 81: OK" % build.name)
+    problems = game_files.check(game, build.name)  # content/ against tools/recomp/builds/<build>-files.txt
+    if problems is None:
+        print("  (no file list for %s: content/ is not checked)" % build.name)
+    elif any(problems):
+        print("  WARNING: game files missing or damaged: %d (content/ against the %s list):" %
+              (sum(len(p) for p in problems), build.name))
+        for line in game_files.report(problems):
+            print("    " + line)
+        print("  The game may crash where it needs them. Dump or extract the game again (or copy it again from "
+              "where it is); a file you changed on purpose shows up here too.")
+    else:
+        print("  content/: every file as in the %s list: OK" % build.name)
+
+    step(3, "translating the game code to C (about a minute)")
+    # code mods built into the NRO (docs/guest-mods-switch-plan.md): prepared and translated first, since the game
+    # code gets their check in the functions they hook; without --guest-mod an earlier set is removed
+    mods_dir = os.path.join(ROOT, "build", "guest-mods")
+    tool = [sys.executable, "-I", os.path.join(ROOT, "tools", "switch", "guest_mods.py"), "--out", mods_dir]
+    renv = dict(os.environ)
+    if args.guest_mod:
+        run(tool + mods + ["--build", build.name] +
+            (["--gc-game", os.path.abspath(args.gc_game)] if args.gc_game else []) +
+            sum((["--option", o] for o in args.mod_option), []))
+        renv["WWHD_RECOMP_MOD_HOOKS_ONLY"] = os.path.join(mods_dir, "hooks.txt")
+    else:
+        run(tool + ["--clear"])
+    gen = os.path.join(ROOT, "build", "gen")
+    if os.path.islink(gen):
+        fail("build/gen is a symbolic link: remove it (or run from a checkout without one)")
+    shutil.rmtree(gen, ignore_errors=True)
+    run([sys.executable, "-I", os.path.join(ROOT, "tools", "recomp", "recomp.py"), os.path.join(game, "code", "Zelda.rpx"), gen],
+        env=renv)
+
+    step(4, "building the Switch homebrew (10-20 minutes the first time)")
+    env = dict(os.environ)
+    if args.jobs:
+        env["WWHD_JOBS"] = str(args.jobs)
+    if native:
+        env["WWHD_NATIVE"] = "1"
+    # build.sh makes the NRO's icon on this machine (with this Python, which has Pillow for the forwarder too)
+    env["WWHD_PYTHON"] = sys.executable
+    if args.icon:
+        env["WWHD_ICON"] = os.path.abspath(args.icon)
+    env["WWHD_GAME_DIR"] = game  # where build.sh makes the icon from
+    if args.name:
+        env["WWHD_NACP_NAME"] = args.name
+    run((native_shell(env) if native else ["bash"]) + ["tools/switch/build.sh"], env=env)
+    nro = os.path.join(ROOT, "build", "switch-dk", "wwhd.nro")
+    if not os.path.isfile(nro):
+        fail("the build made no %s" % nro)
+    dksh = None
+    # (TP HD fork) no release shader template: SwitchWakerHD's is Wind Waker's. The console compiles the graphics as
+    # you play, or --shaders gives your own console's shader manifest (sdmc:/switch/tphd/shader_manifest.bin)
+    shaders = os.path.abspath(args.shaders) if args.shaders and not args.no_shaders else None
+    if shaders:
+        try:
+            dksh = shader_cache(shaders, game)
+        except SystemExit as e:
+            with open(shaders, "rb") as f:
+                if f.read(8) not in (b"WSME0001", b"WWHT0003"):
+                    raise  # the player's own manifest or cache: a failure stops, as always
+            # the release's template (issue #88): the game works without the prepared graphics, so this never stops
+            # the install (the installers show this line as a warning)
+            why = str(e.code).strip().replace("make_sd: ", "") if e.code else "see the messages above"
+            print("make_sd: warning: the graphics were not prepared (%s); the console compiles them as you play" % why,
+                  flush=True)
+            dksh = None
+
+    step(5, "the SD card folder")
+    out = os.path.abspath(args.out)
+    wwhd = os.path.join(out, "switch", "tphd")
+    os.makedirs(wwhd, exist_ok=True)
+    shutil.copyfile(nro, os.path.join(wwhd, "tphd.nro"))
+    if dksh:
+        shutil.copyfile(dksh, os.path.join(wwhd, "shadercache_dksh.bin"))
+    if args.guest_mod:  # sdmc:/switch/wwhd/mods/<id>/: each mod's images and options, and its prepared data
+        with open(os.path.join(mods_dir, "guest-mods.json")) as f:
+            for m in json.load(f)["mods"]:
+                dst = os.path.join(wwhd, "mods", m["id"])
+                shutil.rmtree(dst, ignore_errors=True)
+                shutil.copytree(os.path.join(mods_dir, "sd", m["id"]), dst)
+                shutil.copytree(m["data"], os.path.join(dst, "data"))
+    gdst = os.path.join(wwhd, "game")
+    if os.path.realpath(gdst) != os.path.realpath(game):
+        shutil.rmtree(gdst, ignore_errors=True)
+        for part in ("code", "content", "meta"):
+            shutil.copytree(os.path.join(game, part), os.path.join(gdst, part))
+    if native and not args.no_forwarder:
+        forwarder(args, out, args.icon or game)
+    print("""
+Done: %s
+
+Copy the contents of that folder to the root of the SD card (switch/tphd/ ends up at
+sdmc:/switch/tphd/). Saves and settings already on the card are kept. Then hold R while starting
+any installed game to open the Homebrew Menu in title mode and pick Twilight Princess HD.
+
+These files contain the game: they are for your own console only; do not share them.""" % out)
+
+
+if __name__ == "__main__":
+    main()
