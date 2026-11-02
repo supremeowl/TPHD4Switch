@@ -1369,7 +1369,7 @@ void tab_display() {
         if (mode == 0)
             note("Gaming Mode shows one window at a time. A separate GamePad window may make the game picture blurry.");
         if (mode == 2)
-            note("Shows GamePad menus and the Wind Waker song list while open and follows Off-TV Play.");
+            note("Shows GamePad menus while open and follows Off-TV Play.");
         if (mode == 4)
             note("Only the GamePad picture. In the game, Minus switches to Off-TV "
                  "Play (the game on the GamePad).");
@@ -2286,7 +2286,7 @@ void tab_about() {
              game_lang::name(U.language));
     }
     heading("About");
-    ImGui::Text("The Legend of Zelda: The Wind Waker HD - native port (%s host, %s renderer)", hostui::name(),
+    ImGui::Text("The Legend of Zelda: Twilight Princess HD - native port (%s host, %s renderer)", hostui::name(),
                 render::api_name(render::active()));
     if (*build::variant())  // the decomp build (docs/decomp-build.md)
         ImGui::Text("%s (%s), %s build: the game code runs from the decompiled source (experimental)", build::version(),
@@ -2510,7 +2510,7 @@ void settings_window() {
         ImGui::SetNextWindowFocus();  // keyboard / controller navigation starts in the menu
         U.just_opened = false;
     }
-    if (ImGui::Begin("Wind Waker HD  -  Settings", &open, fl)) {
+    if (ImGui::Begin("Twilight Princess HD  -  Settings", &open, fl)) {
         const std::vector<ext::ShownTab>& tabs = ext::tabs();  // built-in and added (extensions.h)
         // L / R on a controller switch tabs
         if (U.cap_action < 0 && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId)) {
@@ -2552,10 +2552,16 @@ void settings_window() {
         quit_row(open);
     }
     ImGui::End();
-    // B (not while choosing an input or in a list) or the close button closes the menu
+    // B (not while choosing an input or in a list) or the close button closes the menu. (TP HD fork) Nor when a
+    // popup was open the frame before: ImGui closes a dropdown's list on B before this (NavUpdateCancelRequest, in
+    // NewFrame), and that B only closes the list
     if (!open) set_open(false, OpenReason::CloseButton);
-    if (U.cap_action < 0 && navigation_pressed(input_map::face_input(input_map::kB)) && !g_pad_b_used && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId))
+    static bool popupBefore = false;
+    const bool popupNow = ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId);
+    if (U.cap_action < 0 && navigation_pressed(input_map::face_input(input_map::kB)) && !g_pad_b_used && !popupNow &&
+        !popupBefore)
         set_open(false, OpenReason::B);
+    popupBefore = popupNow;
     g_pad_b_used = false;
 }
 

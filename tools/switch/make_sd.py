@@ -17,22 +17,13 @@ usage:
   make_sd.py --wua GAME.wua [--out DIR]       a Cemu Wii U archive (no keys; needs: pip install zstandard)
   make_sd.py --game-dir EXTRACTED [--out DIR] a folder with code/, content/, meta/ (e.g. from Cemu's
                                               mlc01/usr/title/00050000/1019e500, without the update)
-  The graphics (shadercache_dksh.bin) are prepared by default: from this release's shader template, downloaded
-  from its GitHub release (shader-template.sealed: shader states without game code, opened with your dump's files;
-  none there, or offline: the console compiles them as it always did).
-  options: --shaders FILE                     prepare them from FILE instead: the release's template downloaded by
-                                              hand, or your console's shader manifest (sdmc:/switch/tphd/
-                                              shader_manifest.bin, after playing a while): the shaders in it, and
-                                              guesses for the places not in it (a shadercache_gl.bin is still
-                                              accepted: its sources only)
-           --no-shaders                       do not prepare them (the console compiles them)
+  The graphics are not prepared by default: the console compiles each shader the first time it is needed.
+  options: --shaders FILE                     prepare them (shadercache_dksh.bin) from your console's shader
+                                              manifest (sdmc:/switch/tphd/shader_manifest.bin, after playing a
+                                              while): the shaders in it, and guesses for the places not in it (a
+                                              shadercache_gl.bin is still accepted: its sources only)
+           --no-shaders                       ignore --shaders (the console compiles them)
            --jobs N                           parallel compiles (each needs ~1.5 GB of memory)
-           --guest-mod PACKAGE                a code mod (Mod SDK v2) built into the NRO: its id in the mod catalogue
-                                              (downloaded, e.g. gc-minimap), its .zip or its folder; repeat for
-                                              more (tools/switch/guest_mods.py)
-           --gc-game PATH                     your GameCube Wind Waker (.iso/.gcm/.rvz or extracted), for mods
-                                              whose setup reads it (the GameCube sea minimap)
-           --mod-option ID.KEY=VALUE          a mod's option (e.g. gc-minimap.size=260); repeat for more
 
 Needs Python 3 and Docker or Podman, or a native devkitPro (Windows: README.md, "What you need").
 What it makes contains the game: it is for your own console only; do not share it.
@@ -91,6 +82,50 @@ def release_tag():
             line = ""
     m = re.match(r"v\d+\.\d+\.\d+", line)
     return m.group(0) if m else ""
+
+
+# (TP HD fork) An update unzipped over an older source keeps the old build folder, and the new files keep the zip's
+# dates, which can be older than the old build's: make would keep some of the old code. So the build folder notes the
+# source it was built from (cmake/version.txt, filled in in a source zip) and starts again when that changes. Not in a
+# git checkout, whose files get the checkout's date (version.txt is not filled in there).
+BUILD_VERSION_FILE = "source_version.txt"
+
+
+def source_version():
+    """cmake/version.txt as a source zip has it (the tag and the commit), "" in a git checkout or without it"""
+    try:
+        with open(os.path.join(ROOT, "cmake", "version.txt")) as f:
+            text = f.read().strip()
+    except OSError:
+        return ""
+    return "" if not text or "$Format" in text else text
+
+
+def fresh_build_for_new_source(build_dir):
+    """the build folder removed when it was built from another source (or by a version before this check)"""
+    version = source_version()
+    if not version or not os.path.isdir(build_dir):
+        return
+    try:
+        with open(os.path.join(build_dir, BUILD_VERSION_FILE)) as f:
+            built = f.read().strip()
+    except OSError:
+        built = ""
+    if built == version:
+        return
+    print("  %s was built from another version of the source (%s now): building everything again" %
+          (os.path.relpath(build_dir, ROOT), version.split("\n")[0]), flush=True)
+    try:
+        shutil.rmtree(build_dir)
+    except OSError as e:
+        fail("could not remove %s (%s): delete that folder and run this again" % (build_dir, e))
+
+
+def note_build_source(build_dir):
+    version = source_version()
+    if version:
+        with open(os.path.join(build_dir, BUILD_VERSION_FILE), "w") as f:
+            f.write(version + "\n")
 
 
 def release_template():
@@ -234,10 +269,9 @@ def main():
     src.add_argument("--wua", help="a Cemu Wii U archive (.wua; no keys needed)")
     src.add_argument("--game-dir", help="an extracted game folder (code/, content/, meta/)")
     ap.add_argument("--out", default=os.path.join(ROOT, "build", "sd"), help="where the SD card folder goes")
-    ap.add_argument("--shaders", help="prepare the graphics from this file (the release's shader-template.sealed, your "
-                                      "console's shader_manifest.bin or a shadercache_gl.bin) instead of the release's "
-                                      "template, downloaded by default")
-    ap.add_argument("--no-shaders", action="store_true", help="do not prepare the graphics (the console compiles them)")
+    ap.add_argument("--shaders", help="prepare the graphics from this file (your console's shader_manifest.bin or a "
+                                      "shadercache_gl.bin); without it the console compiles them as you play")
+    ap.add_argument("--no-shaders", action="store_true", help="ignore --shaders (the console compiles the graphics)")
     ap.add_argument("--jobs", type=int, help="parallel compiles")
     ap.add_argument("--keys", help="native build: your console's prod.keys, for the HOME-screen forwarder "
                     "(default: .switch\\prod.keys in your user folder; without it the forwarder is skipped)")
@@ -245,9 +279,10 @@ def main():
                     "logo from the game's files, else its meta/iconTex.tga)")
     ap.add_argument("--no-forwarder", action="store_true", help="native build: do not build the forwarder (.nsp)")
     ap.add_argument("--name", help="custom display name for the NRO (default: Twilight Princess HD)")
-    ap.add_argument("--guest-mod", action="append", default=[], help="a code mod built into the NRO (catalogue id, .zip or folder)")
-    ap.add_argument("--gc-game", help="your GameCube Wind Waker, for mods whose setup reads it")
-    ap.add_argument("--mod-option", action="append", default=[], help="a mod's option: ID.KEY=VALUE")
+    # (TP HD fork) SwitchWakerHD's Wind Waker code mods: still parsed so they are refused below, hidden from --help
+    ap.add_argument("--guest-mod", action="append", default=[], help=argparse.SUPPRESS)
+    ap.add_argument("--gc-game", help=argparse.SUPPRESS)
+    ap.add_argument("--mod-option", action="append", default=[], help=argparse.SUPPRESS)
     args = ap.parse_args()
     if not (args.wua or args.game_dir):
         ap.error("one of --game-dir or --wua is required")
@@ -340,10 +375,13 @@ def main():
     env["WWHD_GAME_DIR"] = game  # where build.sh makes the icon from
     if args.name:
         env["WWHD_NACP_NAME"] = args.name
+    build_dir = os.path.join(ROOT, "build", "switch-dk")
+    fresh_build_for_new_source(build_dir)  # (TP HD fork) an update unzipped over an older source
     run((native_shell(env) if native else ["bash"]) + ["tools/switch/build.sh"], env=env)
-    nro = os.path.join(ROOT, "build", "switch-dk", "wwhd.nro")
+    nro = os.path.join(build_dir, "wwhd.nro")
     if not os.path.isfile(nro):
         fail("the build made no %s" % nro)
+    note_build_source(build_dir)
     dksh = None
     # (TP HD fork) no release shader template: SwitchWakerHD's is Wind Waker's. The console compiles the graphics as
     # you play, or --shaders gives your own console's shader manifest (sdmc:/switch/tphd/shader_manifest.bin)

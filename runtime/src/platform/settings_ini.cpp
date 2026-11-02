@@ -152,7 +152,7 @@ File parse(const std::string& text) {
 }
 
 std::string format(const std::map<std::string, std::string>& menu, const std::vector<std::string>& sections) {
-    std::string out = "# Wind Waker HD settings\n";
+    std::string out = "# Twilight Princess HD settings\n";
     for (const auto& [k, v] : menu) out += k + '=' + v + '\n';
     if (!sections.empty()) {
         out += '\n';

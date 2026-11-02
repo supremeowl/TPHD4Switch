@@ -120,6 +120,34 @@ endif()
 
 # ---- vendored Cemu GPU pieces (MPL-2.0): address library + shader decompiler
 set(CEMU_DIR ${CMAKE_SOURCE_DIR}/runtime/third_party/cemu)
+# (TP HD fork) The make build's own dependency scan does not see a header given with -include (and compiler depfiles
+# are off, tools/switch/build.sh), so every source that force-includes cemu_shim.h also depends on it and on the local
+# headers it pulls in (OBJECT_DEPENDS below): a change to one of them rebuilds those sources.
+function(wwhd_local_includes out first)
+  set(seen "")
+  set(todo "${first}")
+  while(todo)
+    list(POP_FRONT todo h)
+    if(h IN_LIST seen)
+      continue()
+    endif()
+    list(APPEND seen "${h}")
+    get_filename_component(dir "${h}" DIRECTORY)
+    file(STRINGS "${h}" lines REGEX "^[ \t]*#[ \t]*include[ \t]*\"")
+    foreach(l IN LISTS lines)
+      string(REGEX REPLACE "^[ \t]*#[ \t]*include[ \t]*\"([^\"]+)\".*$" "\\1" inc "${l}")
+      foreach(base "${dir}" "${CEMU_DIR}")
+        if(EXISTS "${base}/${inc}")
+          get_filename_component(p "${base}/${inc}" ABSOLUTE)
+          list(APPEND todo "${p}")
+          break()
+        endif()
+      endforeach()
+    endforeach()
+  endwhile()
+  set(${out} "${seen}" PARENT_SCOPE)
+endfunction()
+wwhd_local_includes(CEMU_SHIM_HEADERS "${CEMU_DIR}/cemu_shim.h")
 file(GLOB_RECURSE CEMU_SOURCES CONFIGURE_DEPENDS ${CEMU_DIR}/*.cpp)
 if(NOT WWHD_HAS_METAL)
   # the MSL emitter needs metal-cpp (Objective-C runtime); Vulkan uses the GLSL emitter
@@ -129,6 +157,7 @@ add_library(cemu_latte STATIC ${CEMU_SOURCES})
 target_include_directories(cemu_latte PUBLIC ${CMAKE_SOURCE_DIR}/runtime/src ${CEMU_DIR} ${CEMU_DIR}/Cafe ${CMAKE_SOURCE_DIR}/runtime/third_party/metal-cpp
                                              ${CMAKE_SOURCE_DIR}/runtime/third_party/fmt/include)
 target_compile_options(cemu_latte PRIVATE "SHELL:-include \"${CEMU_DIR}/cemu_shim.h\"")
+set_property(SOURCE ${CEMU_SOURCES} APPEND PROPERTY OBJECT_DEPENDS ${CEMU_SHIM_HEADERS})  # (TP HD fork) see above
 if(WWHD_HAS_METAL)
   target_compile_definitions(cemu_latte PUBLIC ENABLE_METAL=1)
 endif()
@@ -289,6 +318,9 @@ set_source_files_properties(runtime/src/gfx/vulkan/shader_translation.cpp
     runtime/src/gfx/vulkan/record_worker.cpp
     runtime/src/gfx/vulkan/handoff_trace.cpp PROPERTIES COMPILE_OPTIONS "")
 set_source_files_properties(runtime/src/button_glyph_font.cpp runtime/src/game_glyph.cpp PROPERTIES COMPILE_OPTIONS "-include;${CEMU_DIR}/cemu_shim.h")
+# (TP HD fork) the force-included headers as dependencies (CEMU_SHIM_HEADERS, at CEMU_DIR)
+set_property(SOURCE ${GX2_SOURCES} ${GFX_SOURCES} runtime/src/button_glyph_font.cpp runtime/src/game_glyph.cpp
+             APPEND PROPERTY OBJECT_DEPENDS ${CEMU_SHIM_HEADERS})
 if(ANDROID)
   # Android: SDLActivity loads the game as libmain.so and calls its SDL_main (android/)
   add_library(wwhd SHARED ${RUNTIME_SOURCES} ${GX2_SOURCES} ${GFX_SOURCES} ${MOD_GFX_SOURCES} ${IMGUI_METAL})

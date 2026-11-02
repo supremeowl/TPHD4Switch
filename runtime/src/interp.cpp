@@ -862,8 +862,10 @@ static const char* const g_env_paced = getenv("WWHD_INTERP_PACED");
 // Windows on ARM64 (Snapdragon X) draws 60 fps only where the Adreno driver's per-draw CPU cost
 // allows: unpaced, the Outset save-state benchmark ran 16 logic steps a second (half speed, and the
 // audio, which follows the game's speed, crackled)
+// (TP HD fork) on by default on the Switch too: at 40 fps its GPU is near its limit, and unpaced a slow frame
+// slows the whole game down
 static std::atomic<bool> g_paced{[] {
-#if defined(__ANDROID__) || (defined(_WIN32) && (defined(_M_ARM64) || defined(__aarch64__)))
+#if defined(__ANDROID__) || defined(__SWITCH__) || (defined(_WIN32) && (defined(_M_ARM64) || defined(__aarch64__)))
     return !g_env_paced || atoi(g_env_paced) != 0;
 #else
     return g_env_paced && atoi(g_env_paced) != 0;
@@ -1595,6 +1597,49 @@ bool repeat_input() {
     static const bool off = getenv("WWHD_INTERP_NO_REPEAT") != nullptr;  // debug
     return enabled() && g_hold_next && !off;
 }
+
+// (TP HD fork) Twilight Princess HD's pass structure (interp_tp.cpp). Wind Waker HD's per-frame function
+// (hook_0203593C above) doesn't exist there: the top of main01's loop marks each pass instead, so this ends the
+// pass that ran and starts the next one, as hook_0203593C does around its call (without Wind Waker's effects,
+// save states, mods and true 60).
+static bool g_tp_pass = false;  // the running pass was started with interpolation on
+void tp_pass_boundary() {
+    if (g_tp_pass) {
+        g_hold_frame = false;
+        after_pass(g_phase);  // g_hold_next: an in-between pass follows (unless paced and it does not fit)
+        g_hold = false;
+        g_record_logic = false;
+        g_tp_pass = false;
+    }
+    g_passes++;
+    log_paced_start();
+    paced_pass_start();
+    if (!enabled() || !g_hold_next) g_logic_steps++;  // (gx2_core.cpp: a swap after a new step is a step's frame)
+    if (!enabled()) {
+        g_hold_next = false;
+        g_phase = 0;
+        g_step_n = 1;
+        return;
+    }
+    g_tp_pass = true;
+    if (g_hold_next) {  // hold pass: no logic (interp_tp.cpp's hooks skip it), drawn at pass_t()
+        g_phase++;
+        g_hold = true;
+        g_hold_frame = true;
+        if (record_pass()) g_record_passes++;
+        return;
+    }
+    g_phase = 0;
+    g_step_n = plan_step();
+    // a step without an in-between frame (40 fps): its logic pass is also its record pass
+    g_record_logic = g_step_n == 0;
+    if (g_record_logic) {
+        g_record_passes++;
+        g_previous_record = true;
+    }
+}
+int step_in_between() { return g_step_n; }  // in-between frames planned for this step (hold pass N records)
+int pass_phase() { return g_phase; }        // 0 logic pass, k hold pass k
 }  // namespace interp
 
 // Sound effect starts (JAIZelBasic::seStart core and the mDoAud_* start wrappers). Some sounds are

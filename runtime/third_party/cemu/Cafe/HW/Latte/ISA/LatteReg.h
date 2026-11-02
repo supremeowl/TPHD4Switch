@@ -1,5 +1,7 @@
 #pragma once
 
+#include <bit>  // (TP HD fork) std::bit_cast (LATTE_BITFIELD_FLOAT)
+
 namespace Latte
 {
 	// common enums
@@ -621,15 +623,17 @@ __typename get_##__regname() const \
 	return static_cast<__typename>(v); \
 }
 
+// (TP HD fork) the float's bits through std::bit_cast: *(float*)&v was type punning, undefined with strict aliasing
+// (-Wstrict-aliasing on every use); the same bits either way
 #define LATTE_BITFIELD_FLOAT(__regname) \
 auto& set_##__regname(float newValue) \
 {	\
-	*(float*)&v = newValue; \
+	v = std::bit_cast<uint32>(newValue); \
     return *this; \
 } \
 float get_##__regname() const \
 {	\
-	return *(float*)&v; \
+	return std::bit_cast<float>(v); \
 }
 
 	class LATTEREG

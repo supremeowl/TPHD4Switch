@@ -23,11 +23,13 @@
 // becomes 1600 (the same apm configuration without the raised GPU clock).
 #include "settings_switch.h"
 #include "shader_wait_switch.h"
+#include "../tp_sprint.h"
 
 #include <switch.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -52,7 +54,8 @@ const char* const kIds[kGpuProfiles] = {"307", "384", "460", "1600"};
 // picture profiles per mode (g_mu); the mode whose profile the renderer has (-1: none yet)
 const char* const kModeIds[kModes] = {"handheld", "docked"};
 const char* const kModeLabels[kModes] = {"Handheld", "Docked"};
-ResProfile g_res[kModes] = {{1.0f, true}, {1.5f, true}};
+// (TP HD fork) handheld 1280x720, its screen's size; docked 1x: TP HD draws 1920x1080 itself
+ResProfile g_res[kModes] = {{kScale720, true}, {1.0f, true}};
 int g_res_mode = -1;
 
 bool docked() { return appletGetOperationMode() == AppletOperationMode_Console; }
@@ -190,6 +193,34 @@ void save_picture() {
 }
 namespace {
 std::atomic<bool> g_captureCombo{false};
+std::atomic<bool> g_captureVideo{false};
+}
+// (TP HD fork) The Capture button's video: the forwarder's NACP has VideoCapture = Manual (make_nacp.py), so the system
+// records only after the application asks for it. The request gives the system a 96 MiB buffer from our heap, kept
+// until the application closes; turning the option off afterwards only stops the recording. Launched through the
+// Homebrew Menu the NACP is another game's, and the system may refuse.
+static void apply_capture_video(bool on) {
+    static bool initialized = false;
+    if (on && !initialized) {
+        bool supported = false;
+        Result rc = appletIsGamePlayRecordingSupported(&supported);
+        LOG("[switch] capture video: supported %d (rc 0x%x), applet type %d", int(supported), rc, int(appletGetAppletType()));
+        rc = appletInitializeGamePlayRecording();
+        if (R_FAILED(rc)) {
+            LOG("[switch] capture video: not available (rc 0x%x)", rc);
+            return;
+        }
+        initialized = true;
+    }
+    if (!initialized) return;
+    const Result rc = appletSetGamePlayRecordingState(on);
+    LOG("[switch] capture video: %s (rc 0x%x)", on ? "on" : "off", rc);
+}
+bool capture_video() { return g_captureVideo.load(std::memory_order_relaxed); }
+void set_capture_video(bool on) {
+    g_captureVideo = on;
+    hostui::set(kKeyCaptureVideo, on ? "1" : "0");
+    apply_capture_video(on);
 }
 bool capture_combo() { return g_captureCombo.load(std::memory_order_relaxed); }
 void set_capture_combo(bool on) {
@@ -256,6 +287,8 @@ void apply_at_start() {
         std::lock_guard<std::mutex> lk(g_mu);
         for (int m = 0; m < kModes; m++) {
             saved_float(mode_key(kKeyResScale, m).c_str(), g_res[m].scale, 0.5f, 2.0f);
+            // (TP HD fork) "0.67" is 1280x720: exactly, not 1287x724
+            if (std::fabs(g_res[m].scale - kScale720) < 0.01f) g_res[m].scale = kScale720;
             std::string v;
             if (hostui::get(mode_key(kKeyDynamicRes, m).c_str(), v) && !v.empty()) g_res[m].dynamic = v != "0";
         }
@@ -281,7 +314,17 @@ void apply_at_start() {
     }
     {
         std::string v;
+        if (hostui::get(kKeySprint, v)) tp_sprint::set_enabled(v == "1");
+        if (hostui::get(kKeySprintKeep, v)) tp_sprint::set_keep_after_release(v == "1");
+        if (hostui::get(kKeySprintSpeed, v) && !v.empty()) tp_sprint::set_speed_choice(atoi(v.c_str()));
+    }
+    {
+        std::string v;
         if (hostui::get(kKeyCaptureCombo, v)) g_captureCombo = v == "1";
+        if (hostui::get(kKeyCaptureVideo, v) && v == "1") {
+            g_captureVideo = true;
+            apply_capture_video(true);
+        }
     }
     {
         std::string v;

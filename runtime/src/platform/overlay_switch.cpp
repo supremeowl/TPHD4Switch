@@ -19,6 +19,7 @@
 #include "../build_info.h"
 #include "../input.h"
 #include "../interp.h"
+#include "../tp_sprint.h"
 #include "../mods/mods.h"
 #include "../mods/warps.h"
 #include "../motion/motion.h"
@@ -178,9 +179,7 @@ void tab_warp() {
 void tab_picture() {
     using namespace switch_settings;
     const ui_text::MenuTexts& tx = ui_text::menu();
-    // first, as the most useful thing here: it removes the black or late-appearing effects of places seen the first
-    // time. One text, below its button (in the game's language, ui_text_switch.cpp); the button says where a sweep stands
-    if (prepare_graphics::ui_section()) set_open(false);  // platform/prepare_graphics_ui_switch.cpp
+    // (TP HD fork) no Prepare graphics section: its sweep goes through Wind Waker HD's places
     // one picture profile per mode (as SwitchWaker): the one shown starts as the active mode's
     heading(tx.resolution);
     static int edit = -1;
@@ -194,13 +193,29 @@ void tab_picture() {
     }
     help(tx.modeHelp);
     const ResProfile rp = res_profile(edit);
-    static const float scales[] = {1.0f, 1.25f, 1.5f};  // (a saved 0.75 still applies; the menu no longer offers it)
-    static const char* const names[] = {"1x  (1280x720)", "1.25x  (1600x900)", "1.5x  (1920x1080)"};
-    for (int i = 0; i < 3; i++) {
-        if (i) ImGui::SameLine();
-        const float s = scales[i];
-        if (radio(names[i], std::fabs(rp.scale - s) < 0.01f))
-            hostui::post([m = edit, rp, s] { set_res_profile(m, {s, rp.dynamic}); });
+    // (TP HD fork) a dropdown. TP HD's own picture is 1920x1080 (Wind Waker HD's 1280x720); 0.67x is the handheld
+    // screen's size, 0.5x as low as dynamic resolution goes. A saved factor not listed (an older menu's 0.75) shows
+    // as itself.
+    static const float scales[] = {0.5f, kScale720, 1.0f, 1.25f, 1.5f};
+    static const char* const names[] = {"0.5x  (960x540)", "0.67x  (1280x720)", "1x  (1920x1080)", "1.25x  (2400x1350)",
+                                        "1.5x  (2880x1620)"};
+    constexpr int kChoices = int(sizeof scales / sizeof scales[0]);
+    int chosen = -1;
+    for (int i = 0; i < kChoices; i++)
+        if (std::fabs(rp.scale - scales[i]) < 0.01f) chosen = i;
+    char other[40];
+    if (chosen < 0)  // the size as the renderer rounds it (dk_surfaces.h scaled_size)
+        snprintf(other, sizeof other, "%.2fx  (%ux%u)", rp.scale, unsigned(1920 * rp.scale + 0.99f),
+                 unsigned(1080 * rp.scale + 0.99f));
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 12.0f);
+    if (ImGui::BeginCombo("##internal_resolution", chosen >= 0 ? names[chosen] : other)) {
+        for (int i = 0; i < kChoices; i++) {
+            const float s = scales[i];
+            if (ImGui::Selectable(names[i], i == chosen) && i != chosen)
+                hostui::post([m = edit, rp, s] { set_res_profile(m, {s, rp.dynamic}); });
+            if (i == chosen) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
     }
     bool dyn;
     if (check(lbl(tx.dynamicRes, "dynres").c_str(), rp.dynamic, &dyn))
@@ -323,14 +338,17 @@ void tab_picture() {
         }
     }
     help(tx.fpsHelp);
-    heading(tx.experimental);
-    warn("%s", tx.experimentalWarn);
-    {
-        // the upstream 60 fps modes (the screen is 60 Hz: 60 fps only)
+    // (TP HD fork) hidden for now (true shows it again): 40 fps frame interpolation stayed at 31 fps or below on Build-10
+    constexpr bool kShowFrameRateModes = false;
+    if (kShowFrameRateModes) {
+        heading(tx.experimental);
+        warn("%s", tx.experimentalWarn);
+        // (TP HD fork) 30 fps or 40 fps frame interpolation (interp_tp.cpp). Wind Waker HD's 60 fps and true 60 are
+        // not offered: the Switch's GPU can't draw TP HD at 60, and true 60 has no TP HD version (it sped the game up)
         const int m = interp::mode();
         auto choose = [](int mode) {
             hostui::post([mode] {
-                if (mode == 1) interp::set_fps(60);
+                if (mode == 1) interp::set_fps(40);
                 interp::set_mode(mode);
                 LOG("[interp] frame rate mode from the Switch tab: %s (not saved)", interp::mode_name());
             });
@@ -338,8 +356,6 @@ void tab_picture() {
         if (radio_tip(lbl(tx.fps30, "interp0").c_str(), m == 0, tx.fps30Tip)) choose(0);
         ImGui::SameLine();
         if (radio_tip(lbl(tx.fpsInterp, "interp1").c_str(), m == 1, tx.fpsInterpTip)) choose(1);
-        ImGui::SameLine();
-        if (radio_tip(lbl(tx.fpsTrue60, "interp2").c_str(), m == 2, tx.fpsTrue60Tip)) choose(2);
         help(tx.fpsModesHelp);
         if (m == 1) {
             bool paced;
@@ -368,6 +384,49 @@ void tab_controller() {
             hostui::post([v] { hostui::set("rumble", v ? "1" : "0"); });
         }
         help(tx.rumbleHelp);
+    }
+
+    // (TP HD fork) hold A to sprint (tp_sprint.cpp)
+    heading(tx.sprintHeading);
+    {
+        bool v;
+        if (check(lbl(tx.sprint, "sprint").c_str(), tp_sprint::enabled(), &v)) {
+            tp_sprint::set_enabled(v);
+            hostui::post([v] { hostui::set(switch_settings::kKeySprint, v ? "1" : "0"); });
+        }
+        help(tx.sprintHelp);
+        if (tp_sprint::enabled()) {
+            if (check(lbl(tx.sprintKeep, "sprintkeep").c_str(), tp_sprint::keep_after_release(), &v)) {
+                tp_sprint::set_keep_after_release(v);
+                hostui::post([v] { hostui::set(switch_settings::kKeySprintKeep, v ? "1" : "0"); });
+            }
+            help(tx.sprintKeepHelp);
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted(tx.sprintSpeed);
+            ImGui::SameLine();
+            const int chosen = tp_sprint::speed_choice();
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8.0f);
+            if (ImGui::BeginCombo("##sprint_speed", tp_sprint::speed_name(chosen))) {
+                for (int i = 0; i < tp_sprint::kSpeedChoices; i++) {
+                    if (ImGui::Selectable(tp_sprint::speed_name(i), i == chosen) && i != chosen) {
+                        tp_sprint::set_speed_choice(i);
+                        hostui::post([i] { hostui::set(switch_settings::kKeySprintSpeed, std::to_string(i)); });
+                    }
+                    if (i == chosen) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            help(tx.sprintSpeedHelp);
+        }
+    }
+
+    // (TP HD fork) the Capture button's video (settings_switch.cpp)
+    heading(tx.captureVideoHeading);
+    {
+        bool v;
+        if (check(lbl(tx.captureVideo, "capturevideo").c_str(), switch_settings::capture_video(), &v))
+            hostui::post([v] { switch_settings::set_capture_video(v); });
+        help(tx.captureVideoHelp);
     }
 
     // gyro aiming with the controller's own motion sensors (input_switch.cpp feeds motion.h); the

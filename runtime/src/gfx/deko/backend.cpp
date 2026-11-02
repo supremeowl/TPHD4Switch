@@ -26,6 +26,8 @@ extern "C" char* fake_heap_end;  // libnx: the end of the heap malloc grows into
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -40,6 +42,7 @@ extern "C" char* fake_heap_end;  // libnx: the end of the heap malloc grows into
 #include "gx2/gx2.h"
 #include "imgui.h"
 #include "input.h"
+#include "interp.h"
 #include "overlay/hostui.h"
 #include "overlay/overlay.h"
 #include "platform/debug_switch.h"
@@ -417,21 +420,60 @@ struct OverlayStats {
     double renderBusy = -1, gpuBusyPct = -1, draws = 0;
 } overlayStats;
 
+// (TP HD fork) the frames the window shows, for the counter (present(), render thread; the held frames of #49 are
+// drawn but not shown, and R.frame counts them too): the last 10 seconds of them, each with the time since the one
+// before. A gap of 5 s or more (sleep, the HOME menu) is a break, not a frame.
+struct ShownFrames {
+    std::deque<std::pair<uint64_t, double>> recent;  // when shown (now_ns), ms since the frame before
+    uint64_t last = 0, total = 0;
+    void shown(uint64_t now) {
+        total++;
+        if (last && now - last < 5'000'000'000ull) recent.push_back({now, double(now - last) / 1e6});
+        else recent.clear();
+        last = now;
+        while (!recent.empty() && now - recent.front().first > 10'000'000'000ull) recent.pop_front();
+    }
+} g_shownFrames;
+
 void draw_fps() {
     const int mode = overlay_mode();
     if (mode <= 0) return;
-    static uint64_t windowStart = now_ns(), windowFrame = R.frame;
-    static double fps = 0;
+    // (TP HD fork) now: frames shown in the last half second; the average and the 1% low (the slowest 1% of the
+    // frames, as frames per second: where stutter shows) over the last 10 seconds
+    static uint64_t windowStart = now_ns(), windowShown = g_shownFrames.total;
+    static double fps = 0, avg = 0, low = 0;
     const uint64_t now = now_ns();
     if (now - windowStart >= 500'000'000) {
-        fps = double(R.frame - windowFrame) * 1e9 / double(now - windowStart);
+        fps = double(g_shownFrames.total - windowShown) * 1e9 / double(now - windowStart);
         windowStart = now;
-        windowFrame = R.frame;
+        windowShown = g_shownFrames.total;
+        std::vector<double> ms;
+        ms.reserve(g_shownFrames.recent.size());
+        double sum = 0;
+        for (const auto& f : g_shownFrames.recent) {
+            ms.push_back(f.second);
+            sum += f.second;
+        }
+        avg = low = 0;
+        if (ms.size() >= 10 && sum > 0) {
+            avg = 1000.0 * double(ms.size()) / sum;
+            const size_t worst = std::max<size_t>(1, ms.size() / 100);
+            std::partial_sort(ms.begin(), ms.begin() + ptrdiff_t(worst), ms.end(), std::greater<double>());
+            double slow = 0;
+            for (size_t i = 0; i < worst; i++) slow += ms[i];
+            low = 1000.0 * double(worst) / slow;
+        }
     }
     std::vector<std::string> lines;
     char b[32];
     snprintf(b, sizeof b, "%.1f FPS", fps);
     lines.push_back(b);
+    if (avg > 0) {
+        snprintf(b, sizeof b, "AVG %.1f", avg);
+        lines.push_back(b);
+        snprintf(b, sizeof b, "1%% LOW %.1f", low);
+        lines.push_back(b);
+    }
     if (mode >= 2) {
         auto& s = overlayStats;
         if (s.renderBusy >= 0) {
@@ -615,7 +657,7 @@ bool dynamic_res_requested() {
 }
 
 // ---- dynamic resolution (as gfx/gl's DynamicRes; WWHD_DYNAMIC_RES, on unless =0; =0.x sets the lowest factor,
-// default 0.75): when the GPU is the limit (frames below 30 per second with the GPU still on the previous frame
+// default 0.5: TP HD fork, 960x540 of its 1920x1080, as Wind Waker HD's 0.75 of 1280x720): when the GPU is the limit (frames below 30 per second with the GPU still on the previous frame
 // at present), screen-shaped render targets drop to a lower internal resolution, in steps of 0.05, by what the
 // frame rate says is missing; with GPU time to spare at the start of frames (GpuPasses, below) it steps back up.
 // A step up that the GPU cannot hold is undone, and the next try waits twice as long (up to a minute). The HUD
@@ -626,7 +668,7 @@ std::atomic<float> g_profileScale{1.0f};
 std::atomic<bool> g_profileDynamic{true};
 struct DynamicRes {
     bool on = false, ready = false;
-    float lo = 0.75f, hi = 1.0f, scale = 1.0f, loAsked = 0.75f;
+    float lo = 0.5f, hi = 1.0f, scale = 1.0f, loAsked = 0.5f;  // (TP HD fork) floor 0.5 (was 0.75)
     uint32_t profileSeen = 0;
     uint64_t windowStart = 0, frames = 0, behind = 0;
     uint64_t lastDown = 0, lastUp = 0, backoff = 4'000'000'000ull, calmSince = 0;
@@ -698,10 +740,13 @@ struct DynamicRes {
             settle = false;
             return;
         }
-        if (fps < 29.0 && behindPct >= 50) {
-            // the share of GPU time to cut (to 31.5 ms frames), most of it scales with the pixel count;
-            // at most three steps at a time (each step costs the render targets a resample)
-            const double cut = 1.0 - 31.5 / (1000.0 / fps), pixels = std::max(0.5, 1.0 - cut / 0.85);
+        // (TP HD fork) the frame rate aimed for: 30, or 40 with 40 fps frame interpolation (interp_tp.cpp); was 30
+        // only (29 / 29.7 fps, 31.5 ms frames)
+        const double target = interp::mode() == 1 ? double(interp::output_fps()) : 30.0;
+        if (fps < target - 1.0 && behindPct >= 50) {
+            // the share of GPU time to cut (to frames of 94.5% of the target's), most of it scales with the pixel
+            // count; at most three steps at a time (each step costs the render targets a resample)
+            const double cut = 1.0 - 945.0 / target / (1000.0 / fps), pixels = std::max(0.5, 1.0 - cut / 0.85);
             float s = std::min(step_down(scale), std::floor(float(scale * std::sqrt(pixels)) * 20.0f) / 20.0f);
             s = std::max(s, std::floor(scale * 20.0f - 0.01f) / 20.0f - 0.10f);
             if (lastUp && now - lastUp < 4'000'000'000ull) backoff = std::min<uint64_t>(backoff * 2, 64'000'000'000ull);
@@ -716,7 +761,7 @@ struct DynamicRes {
             idleSamples = 0;
         }
         if (now - calmSince > 30'000'000'000ull) backoff = 4'000'000'000ull;
-        if (scale < hi && idleSamples >= 3 && fps >= 29.7 && now - lastDown >= backoff && now - calmSince >= 2'000'000'000ull) {
+        if (scale < hi && idleSamples >= 3 && fps >= target - 0.3 && now - lastDown >= backoff && now - calmSince >= 2'000'000'000ull) {
             lastUp = now;
             idleSamples = 0;
             apply(std::min(hi, scale + 0.05f), "GPU time to spare", fps, behindPct);
@@ -1328,6 +1373,7 @@ void present() {
     S.scanSrc = nullptr;
     if (S.tvSource) S.tvSource->hudFull = false;
     if (S.drcSource) S.drcSource->hudFull = false;
+    g_shownFrames.shown(now_ns());  // (TP HD fork) a frame the window shows (the counter's figures)
     draw_fps();
     // the settings overlay (Minus held, overlay/overlay.h), over the picture and the FPS counter
     // (the window's real size: the UI grows with it, overlay.cpp)

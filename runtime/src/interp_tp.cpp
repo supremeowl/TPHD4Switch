@@ -1,0 +1,500 @@
+// (TP HD fork) Frame interpolation for Twilight Princess HD: the game hooks. Ported from AsadSi's TP HD recomp
+// (github.com/AsadSi/twilight-princess-hd-recomp, runtime/src/interp.cpp, MPL-2.0), on this fork's pass structure
+// (interp.cpp: tp_pass_boundary, plan_step, keep game speed), which also has 40 fps: 3 logic steps over 4 frames,
+// one step of three with an in-between frame and the other two drawn once, exactly (a record logic pass).
+// interp.cpp's own hooks are Wind Waker HD's and are not in this game's hooks.txt.
+//
+// main01's loop (02AF0EDC) runs one game step per pass: pad read, frame begin, fapGm_Execute (the painter, then the
+// process handlers: delete, priority, create, execute, draw), audio and the HD systems, present. With interpolation
+// on, a logic pass is followed by N hold passes (N = interp::step_in_between(): 1 at 60 fps; at 40 fps 1 or 0) that
+// only begin the frame, paint, draw and present (the hooks below skip the rest):
+//   logic pass:     the game steps from S to S+1; draws blended at pass_t() = 1/(N+1) (N = 0: exactly, recorded)
+//   hold pass k:    no logic; draws at (k+1)/(N+1); the last (k = N) draws S+1 exactly and records it as the next
+//                   step's "before"
+// Blended: the camera (camera_draw 028E13CC: eye, center, up, fovy, bank, the cutscene bars), every J3D model
+// (J3DModel::viewCalc 02B5CF50: world and envelope matrices), models' material animation and particles. Not here
+// yet: AsadSi's 2D panes (his J2DPane::draw hook in aspect.cpp), so the HUD and menus move at 30 Hz.
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <unordered_map>
+#include <vector>
+
+#include "runtime.h"
+
+namespace interp {
+bool enabled();
+bool hold_pass();
+float pass_t();
+bool record_pass();
+void tp_pass_boundary();
+int step_in_between();
+int pass_phase();
+}  // namespace interp
+
+namespace {
+using interp::hold_pass;
+using interp::pass_t;
+using interp::record_pass;
+bool on() { return interp::enabled(); }
+int phase() { return interp::pass_phase(); }
+int in_between() { return interp::step_in_between(); }
+
+uint64_t g_records = 0;  // record passes so far (counted once each has ended)
+uint64_t g_passes = 0;   // every pass
+
+float blend_f(float a, float b, float t) { return a + (b - a) * t; }
+float dist(const float* a, const float* b) {
+    float d = 0;
+    for (int i = 0; i < 3; i++) d += (a[i] - b[i]) * (a[i] - b[i]);
+    return std::sqrt(d);
+}
+void read_words(uint32_t at, uint32_t count, uint32_t* out) { memcpy(out, mem::ptr(at), count * 4); }
+float bf(uint32_t w) {  // a guest float word as it is in memory (big-endian)
+    w = __builtin_bswap32(w);
+    float f;
+    memcpy(&f, &w, 4);
+    return f;
+}
+uint32_t fb(float f) {
+    uint32_t w;
+    memcpy(&w, &f, 4);
+    return __builtin_bswap32(w);
+}
+
+// ---------------------------------------------------------------- camera
+// view_class: fovy +0xD0, eye +0xD8, center +0xE4, up +0xF0, bank (s16) +0xFC; the camera process's cutscene bars
+// (dCamera_c::mTrimHeight, eased toward their size in the camera's execute) +0xB68
+constexpr uint32_t kFovy = 0xD0, kEye = 0xD8, kCenter = 0xE4, kUp = 0xF0, kBank = 0xFC, kTrim = 0xB68;
+struct Cam {
+    float eye[3], center[3], up[3], fovy, trim;
+    int16_t bank;
+};
+Cam read_cam(uint32_t v) {
+    Cam s;
+    for (int i = 0; i < 3; i++) {
+        s.eye[i] = (float)ldf32(v + kEye + 4 * i);
+        s.center[i] = (float)ldf32(v + kCenter + 4 * i);
+        s.up[i] = (float)ldf32(v + kUp + 4 * i);
+    }
+    s.fovy = (float)ldf32(v + kFovy);
+    s.trim = (float)ldf32(v + kTrim);
+    s.bank = (int16_t)ld16(v + kBank);
+    return s;
+}
+void write_cam(uint32_t v, const Cam& s) {
+    for (int i = 0; i < 3; i++) {
+        stf32(v + kEye + 4 * i, s.eye[i]);
+        stf32(v + kCenter + 4 * i, s.center[i]);
+        stf32(v + kUp + 4 * i, s.up[i]);
+    }
+    stf32(v + kFovy, s.fovy);
+    st16(v + kBank, (uint16_t)s.bank);
+}
+// Cuts (doors, re-centring, cutscene shots) are not blended: a step far larger than the camera's recent motion, or
+// larger than an absolute limit, or a turn of more than 45 degrees, or the eye's distance from the center changing
+// by over a tenth in a step, far more than in the step before (the camera's collision pulling it in). Orbits keep
+// the eye on the arc: its direction from the center and its distance blend separately.
+struct CamPrev { Cam s{}; bool valid = false, cut = false; float last_step = 0, last_pull = 0; };
+// the step's cut decision (logic pass); its hold passes reuse it
+void decide_cut(CamPrev& p, const Cam& a, const Cam& b) {
+    const float step = std::max(dist(a.eye, b.eye), dist(a.center, b.center)), prev = p.last_step;
+    const float la = dist(a.eye, a.center), lb = dist(b.eye, b.center), pull = std::fabs(la - lb), prev_pull = p.last_pull;
+    p.last_step = step;
+    p.last_pull = pull;
+    p.cut = step > 800 || std::fabs(a.fovy - b.fovy) > 20 || (step > 60 && step > 4 * prev + 20) ||
+            (pull > 0.1f * std::max(la, lb) && pull > 3 * prev_pull + 10);
+}
+bool blend_cam(const CamPrev& p, const Cam& a, const Cam& b, float t, Cam& m) {
+    if (p.cut) return false;
+    float da[3], db[3], la = 0, lb = 0;
+    for (int i = 0; i < 3; i++) {
+        m.center[i] = blend_f(a.center[i], b.center[i], t);
+        da[i] = a.eye[i] - a.center[i];
+        db[i] = b.eye[i] - b.center[i];
+        la += da[i] * da[i];
+        lb += db[i] * db[i];
+    }
+    la = std::sqrt(la);
+    lb = std::sqrt(lb);
+    if (la < 1e-3f || lb < 1e-3f) {
+        for (int i = 0; i < 3; i++) m.eye[i] = blend_f(a.eye[i], b.eye[i], t);
+    } else {
+        float cosang = 0, dir[3], ld = 0;
+        for (int i = 0; i < 3; i++) cosang += da[i] / la * db[i] / lb;
+        if (cosang < 0.7071f) return false;  // more than 45 degrees: a cut
+        for (int i = 0; i < 3; i++) dir[i] = (1 - t) * da[i] / la + t * db[i] / lb, ld += dir[i] * dir[i];
+        ld = std::sqrt(ld);
+        for (int i = 0; i < 3; i++) m.eye[i] = m.center[i] + dir[i] / ld * blend_f(la, lb, t);
+    }
+    // up: perpendicular to the blended view direction, so the in-between frame gets no extra roll
+    float fwd[3], lf = 0, d = 0, lu = 0;
+    for (int i = 0; i < 3; i++) m.up[i] = blend_f(a.up[i], b.up[i], t), fwd[i] = m.center[i] - m.eye[i], lf += fwd[i] * fwd[i];
+    lf = std::sqrt(lf);
+    for (int i = 0; i < 3; i++) fwd[i] /= lf, d += m.up[i] * fwd[i];
+    for (int i = 0; i < 3; i++) m.up[i] -= d * fwd[i], lu += m.up[i] * m.up[i];
+    lu = std::sqrt(lu);
+    for (int i = 0; i < 3; i++) m.up[i] = lu > 0.1f ? m.up[i] / lu : b.up[i];
+    m.fovy = blend_f(a.fovy, b.fovy, t);
+    m.bank = (int16_t)(a.bank + (int16_t)std::lround((int16_t)(b.bank - a.bank) * t));  // the short way round
+    return true;
+}
+std::unordered_map<uint32_t, CamPrev> g_cams;
+
+// ---------------------------------------------------------------- models
+// J3DModel (TP HD's layout: the decomp's less the vtable): model data +0x00 (joint count +0x24, envelope count
+// +0x26), matrix buffer +0x80 (world matrices +0x0C, envelope matrices +0x10); 3x4 row-major float matrices
+struct ModelPrev {
+    uint64_t pass = 0;  // the record pass that recorded it
+    uint32_t anm = 0, wev = 0, n = 0, w = 0;
+    std::vector<uint32_t> m;      // the guest words (big-endian floats) of the world, then the envelope matrices
+    std::vector<uint32_t> exact;  // the step's own, while the blended ones wait for the painter
+    std::vector<uint32_t> mid;    // the blended ones
+    uint64_t held = ~0ull;        // the pass that left it blended
+};
+std::unordered_map<uint32_t, ModelPrev> g_models;
+std::vector<uint32_t> g_held;  // models left blended
+// whether a model's root joint (the first matrix) moved too far in a step: a teleport. Only the root: a big model's
+// limbs can swing further than that in a step (Stallord's skull, 464 units), and they blend.
+bool teleported(const uint32_t* a, const uint32_t* b) {
+    for (int j : {3, 7, 11})
+        if (std::fabs(bf(a[j]) - bf(b[j])) > 300) return true;
+    return false;
+}
+// matrices blended from a to b at t into guest memory at `at`
+void blend_into(uint32_t at, const uint32_t* a, const uint32_t* b, uint32_t mats, float t) {
+    uint32_t* g = (uint32_t*)mem::ptr(at);
+    for (uint32_t i = 0; i < mats * 12; i++) g[i] = fb(blend_f(bf(a[i]), bf(b[i]), t));
+}
+
+// JPABaseParticle: position +0x00 (global, set by the particle calc), age +0x80; a JPANode holds it at +0x08
+// (next node +0x04)
+struct PtclPrev {
+    uint64_t pass = 0;
+    int16_t age = 0;
+    uint32_t p[3] = {};
+};
+std::unordered_map<uint32_t, PtclPrev> g_ptcls;
+// a material animation's frame in one model, keyed by model << 32 | animation
+struct AnmPrev {
+    uint64_t pass = 0;
+    float frame = 0;
+};
+std::unordered_map<uint64_t, AnmPrev> g_anms;
+uint32_t g_calc_model = 0;  // the model whose materials J3DModel::calcMaterial is calculating
+}  // namespace
+
+extern "C" {
+void f_028E13CC_orig(Cpu* c);
+void f_02B5CF50_orig(Cpu* c);
+}
+
+// camera_draw(camera_process_class*)
+extern "C" void hook_028E13CC(Cpu* c) {
+    const uint32_t v = c->r[3];
+    if (!on()) return f_028E13CC_orig(c);
+    CamPrev& p = g_cams[v];
+    const Cam cur = read_cam(v);
+    if (record_pass()) {  // exact: the next step's "before"
+        p.s = cur;
+        p.valid = true;
+        return f_028E13CC_orig(c);
+    }
+    if (!p.valid) return f_028E13CC_orig(c);
+    if (!hold_pass()) decide_cut(p, p.s, cur);
+    Cam mid;
+    const float t = pass_t();
+    const bool blended = blend_cam(p, p.s, cur, t, mid);
+    if (blended) write_cam(v, mid);
+    stf32(v + kTrim, blend_f(p.s.trim, cur.trim, t));  // the bars slide in and out between steps, cut or not
+    f_028E13CC_orig(c);
+    if (blended) write_cam(v, cur);
+    stf32(v + kTrim, cur.trim);
+}
+
+// J3DModel::viewCalc(J3DModel*)
+extern "C" void hook_02B5CF50(Cpu* c) {
+    const uint32_t model = c->r[3];
+    if (!on()) return f_02B5CF50_orig(c);
+    const uint32_t data = ld32(model), buf = ld32(model + 0x80);
+    const uint32_t n = data ? ld16(data + 0x24) : 0, w = data ? ld16(data + 0x26) : 0;
+    const uint32_t anm = buf ? ld32(buf + 0x0C) : 0, wev = buf ? ld32(buf + 0x10) : 0;
+    if (!anm || n == 0 || n > 512 || w > 1024 || (w && !wev)) return f_02B5CF50_orig(c);
+    ModelPrev& p = g_models[model];
+    // drawn before fpcDt_Handler's restore (the Collection screen's Link, drawn each pass) and still as the last pass
+    // blended it: the step's own first, or each hold pass took the blend for the step and drew it again
+    if (p.held + 1 == g_passes && p.anm == anm && p.wev == wev && p.n == n && p.w == w && p.mid.size() == (n + w) * 12 &&
+        p.exact.size() == p.mid.size() && !memcmp(mem::ptr(anm), p.mid.data(), n * 48) &&
+        (!w || !memcmp(mem::ptr(wev), p.mid.data() + n * 12, w * 48))) {
+        memcpy(mem::ptr(anm), p.exact.data(), n * 48);
+        if (w) memcpy(mem::ptr(wev), p.exact.data() + n * 12, w * 48);
+    }
+    if (record_pass()) {
+        f_02B5CF50_orig(c);
+        p.pass = g_records;
+        p.anm = anm, p.wev = wev, p.n = n, p.w = w;
+        p.m.resize((n + w) * 12);
+        read_words(anm, n * 12, p.m.data());
+        if (w) read_words(wev, w * 12, p.m.data() + n * 12);
+        return;
+    }
+    // blended: only from the step's "before" (the last record pass, counted once it ended), with the same matrices
+    if (p.pass + 1 != g_records || p.anm != anm || p.wev != wev || p.n != n || p.w != w) return f_02B5CF50_orig(c);
+    std::vector<uint32_t> cur((n + w) * 12);
+    read_words(anm, n * 12, cur.data());
+    if (w) read_words(wev, w * 12, cur.data() + n * 12);
+    // drawn again in the pass: as it is while it still has its blend; calculated again since (Stallord calculates
+    // and draws his 12 times a step, the skull settling each time), the new matrices are the step's own
+    if (p.held == g_passes && cur == p.mid) return f_02B5CF50_orig(c);
+    p.exact = std::move(cur);
+    if (teleported(p.m.data(), p.exact.data())) return f_02B5CF50_orig(c);  // draw the step exactly
+    const float t = pass_t();
+    blend_into(anm, p.m.data(), p.exact.data(), n, t);
+    if (w) blend_into(wev, p.m.data() + n * 12, p.exact.data() + n * 12, w, t);
+    p.mid.resize((n + w) * 12);
+    read_words(anm, n * 12, p.mid.data());
+    if (w) read_words(wev, w * 12, p.mid.data() + n * 12);
+    f_02B5CF50_orig(c);
+    if (p.held != g_passes) p.held = g_passes, g_held.push_back(model);
+}
+
+// Skinned models are drawn from their world and envelope matrices by the painter at the start of the next pass, so
+// the blended ones stay until then; the step's own come back right after it, before the pass's logic and draws
+// (fpcDt_Handler, the first handler after the painter).
+static void restore_models() {
+    for (const uint32_t model : g_held) {
+        const ModelPrev& p = g_models[model];
+        memcpy(mem::ptr(p.anm), p.exact.data(), p.n * 48);
+        if (p.w) memcpy(mem::ptr(p.wev), p.exact.data() + p.n * 12, p.w * 48);
+    }
+    g_held.clear();
+    if (g_models.size() > 4096) g_models.clear();  // models are freed with their actors: drop old records
+}
+
+// What calls each animated material's J3DMaterialAnm::calc (below), with the model (or, for static models, the
+// model data) it is for: J3DModel::calcMaterial(J3DModel*) in the draw, J3DModel::entry(J3DModel*), and
+// J3DModelData::simpleCalcMaterial(J3DModelData*, u16, Mtx) for models drawn by particle emitters (02AA28C0: Stallord's
+// rocks and debris). Without the last two, their animations were evaluated as they are, at 30 Hz.
+#define CALC_MODEL(a)                       \
+    extern "C" void f_##a##_orig(Cpu* c);   \
+    extern "C" void hook_##a(Cpu* c) {      \
+        const uint32_t outer = g_calc_model; \
+        g_calc_model = c->r[3];             \
+        f_##a##_orig(c);                    \
+        g_calc_model = outer;               \
+    }
+CALC_MODEL(02B5C544)
+CALC_MODEL(02B5C2DC)
+CALC_MODEL(02B5D320)
+
+// J3DMaterialAnm::calc(material anm, material): texture scrolls (SRT), texture patterns, material and TEV colors at
+// their animations' frames, which the actors set in their draw from frame counters that execute advances. The
+// entries ({index u16, on u16, animation}): material colors 2 at +0x00 (8 apart), texture matrices 8 at +0x10,
+// texture numbers 8 at +0x50 (12 apart), TEV colors 4 at +0xB0, TEV konst colors 4 at +0xD0. An animation
+// (J3DAnmBase): frame count s16 +0x02, frame f32 +0x04. Blended like models, per model (actors share animations):
+// a frame that went forward by up to 4 (wrapping at the frame count) draws between; stopped, reversed or jumped
+// draws as it is.
+extern "C" void f_02B58040_orig(Cpu* c);
+extern "C" void hook_02B58040(Cpu* c) {
+    if (!on() || !g_calc_model) return f_02B58040_orig(c);
+    const uint32_t ma = c->r[3];
+    uint32_t anms[26], n = 0, saved[26];
+    auto add = [&](uint32_t e) {
+        if (!ld16(e + 2)) return;
+        const uint32_t a = ld32(e + 4);
+        if (a && std::find(anms, anms + n, a) == anms + n) anms[n++] = a;
+    };
+    for (uint32_t i = 0; i < 2; i++) add(ma + 8 * i);
+    for (uint32_t i = 0; i < 8; i++) add(ma + 0x10 + 8 * i), add(ma + 0x50 + 12 * i);
+    for (uint32_t i = 0; i < 8; i++) add(ma + 0xB0 + 8 * i);
+    const float t = pass_t();
+    const bool rec = record_pass();
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t a = anms[i];
+        saved[i] = ld32(a + 4);
+        AnmPrev& p = g_anms[uint64_t(g_calc_model) << 32 | a];
+        const float cur = u32_as_f32(saved[i]), count = (int16_t)ld16(a + 2);
+        if (rec) {
+            p = {g_records, cur};
+            continue;
+        }
+        if (p.pass + 1 != g_records) continue;
+        float d = cur - p.frame;
+        if (d < 0) d += count;
+        if (d <= 0 || d > 4) continue;
+        float f = p.frame + d * t;
+        if (f >= count) f -= count;
+        stf32(a + 4, f);
+    }
+    f_02B58040_orig(c);
+    for (uint32_t i = 0; i < n; i++) st32(anms[i] + 4, saved[i]);
+}
+
+// JPAEmitterManager::draw(manager, draw info, group), from the painter at the start of a pass. Particles move only
+// in the particle calc of a logic pass, after its painter: so the logic pass records them as they are, and the
+// hold passes after it draw each one between that and the new step, as models are shown (a pass after their
+// viewCalc); a particle that is new, or not one step older, draws as it is. The group's emitters: use lists at +0x00,
+// 0xC apart (JSULink: emitter +0x00, next +0x0C); an emitter's particles and child particles: JPALists at +0xC8 and
+// +0xD4 (first node +0x00).
+extern "C" void f_02B17008_orig(Cpu* c);
+extern "C" void hook_02B17008(Cpu* c) {
+    if (!on()) return f_02B17008_orig(c);
+    const bool rec = !hold_pass();  // the painter runs before the pass's particle calc: a logic pass shows the step before
+    const float t = float(phase()) / float(in_between() + 1);
+    std::vector<std::pair<uint32_t, PtclPrev>> put_back;
+    for (uint32_t l = ld32(ld32(c->r[3]) + (c->r[5] & 0xFF) * 0xC); l; l = ld32(l + 0xC))
+        for (uint32_t list : {ld32(l) + 0xC8, ld32(l) + 0xD4})
+            for (uint32_t node = ld32(list); node; node = ld32(node + 4)) {
+                const uint32_t pt = node + 8;
+                PtclPrev cur;
+                cur.age = (int16_t)ld16(pt + 0x80);
+                read_words(pt, 3, cur.p);
+                if (rec) {
+                    cur.pass = g_records;
+                    g_ptcls[pt] = cur;
+                    continue;
+                }
+                const auto it = g_ptcls.find(pt);
+                if (it == g_ptcls.end() || it->second.pass != g_records || it->second.age + 1 != cur.age) continue;
+                const uint32_t* a = it->second.p;
+                if (std::fabs(bf(a[0]) - bf(cur.p[0])) + std::fabs(bf(a[1]) - bf(cur.p[1])) + std::fabs(bf(a[2]) - bf(cur.p[2])) > 300)
+                    continue;
+                put_back.push_back({pt, cur});
+                uint32_t* g = (uint32_t*)mem::ptr(pt);
+                for (int i = 0; i < 3; i++) g[i] = fb(blend_f(bf(a[i]), bf(cur.p[i]), t));
+            }
+    f_02B17008_orig(c);
+    for (auto& [pt, cur] : put_back) memcpy(mem::ptr(pt), cur.p, 12);
+    if (g_ptcls.size() > 65536) g_ptcls.clear();
+}
+
+// ---------------------------------------------------------------- the pass structure
+// Hold passes skip the step's logic: in main01's loop, the pad read, audio and HD systems; in fpcM_Management,
+// the delete, priority and create handlers (which report success), execute, the post callback (fapGm_After),
+// cCt_Counter and animation frame counters (J3DFrameCtrl::update, which some draws call); in the play scene's draw
+// (dScnPly_Draw 02AC08B4), collision and BG moves, vibration, daSus, particle calc and the scene change request.
+// Its inline frame counter (1028EBC8) is put back.
+#define HOLD_SKIP(a)                          \
+    extern "C" void f_##a##_orig(Cpu* c);     \
+    extern "C" void hook_##a(Cpu* c) {        \
+        if (!hold_pass()) f_##a##_orig(c);    \
+    }
+#define HOLD_SKIP_OK(a)                       \
+    extern "C" void f_##a##_orig(Cpu* c);     \
+    extern "C" void hook_##a(Cpu* c) {        \
+        if (hold_pass()) c->r[3] = 1;         \
+        else f_##a##_orig(c);                 \
+    }
+HOLD_SKIP(02AF0A98)     // pad read
+HOLD_SKIP(02AD9F9C)     // audio
+HOLD_SKIP(02003ED8)
+HOLD_SKIP(02AF09B8)
+HOLD_SKIP(02AFA7A0)     // HD systems (object at 1012B65C)
+HOLD_SKIP_OK(02AD9664)  // fpcPi_Handler
+HOLD_SKIP_OK(02AD6C78)  // fpcCt_Handler
+HOLD_SKIP(02AD752C)     // fpcEx_Handler
+HOLD_SKIP(0290DD38)
+HOLD_SKIP(02ACD0A8)     // fapGm_After
+HOLD_SKIP(02BEF838)     // cCt_Counter
+HOLD_SKIP(02B520C4)     // J3DFrameCtrl::update: some actors advance their animations in their draw (the attention arrow)
+HOLD_SKIP(02902B4C)     // dComIfG_Ccsp()->Move()
+HOLD_SKIP(028C2AB0)     // dComIfG_Bgsp().ClrMoveFlag()
+HOLD_SKIP(02ACC800)     // vibration Run
+HOLD_SKIP(0290CDAC)     // daSus_c::execute
+HOLD_SKIP(028C2C00)     // dComIfG_Bgsp().Move()
+HOLD_SKIP(02A9D6E4)     // particle calc 3D
+HOLD_SKIP(02A9D41C)     // particle calc 2D
+HOLD_SKIP_OK(02AD5B3C)  // fopScnM_ChangeReq
+
+// The painter advances the screen fade (mDoGph_gInf_c::calcFade 02AEAD04: rate 1012B364 += speed 1012B368 while on,
+// 1012B3BE) and the wipe (dDlst_list_c::calcWipe 02919F48: rate 1011DAF0, speed 1011DAF4, on 1011DAFC) each pass and
+// draws what they reach: a hold pass draws them its share of a step ahead and puts them back. It also runs the menu
+// particles (dPa_control_c::calcMenu 02A9D7F8), which hold passes skip. Each had run at N+1 times its speed.
+static void draw_ahead(Cpu* c, void (*orig)(Cpu*), uint32_t rate, uint32_t speed, uint32_t on_flag) {
+    if (!hold_pass()) return orig(c);
+    const uint32_t r = ld32(rate), s = ld32(speed);
+    const uint8_t o = ld8(on_flag);
+    stf32(speed, u32_as_f32(s) * float(phase()) / float(in_between() + 1));
+    orig(c);
+    st32(rate, r), st32(speed, s), st8(on_flag, o);
+}
+extern "C" void f_02AEAD04_orig(Cpu* c);
+extern "C" void f_02919F48_orig(Cpu* c);
+extern "C" void hook_02AEAD04(Cpu* c) { draw_ahead(c, f_02AEAD04_orig, 0x1012B364, 0x1012B368, 0x1012B3BE); }
+extern "C" void hook_02919F48(Cpu* c) { draw_ahead(c, f_02919F48_orig, 0x1011DAF0, 0x1011DAF4, 0x1011DAFC); }
+HOLD_SKIP(02A9D7F8)
+
+// The scene change fade is the display's JUTFader, run from the end of each pass's frame (JUTFader::control
+// 02B9F530 from 02B12F2C): status +0x00 (0 black, 1 clear, 2 fading in, 3 out), a pending status +0x20 taken after
+// +0x1C frames, duration u16 +0x04, count u16 +0x06, alpha +0x0B = count / duration once it has counted. A hold
+// pass advances nothing (the control's state is put back) and draws (count + t) / duration, the count and duration
+// scaled so the integer division lands there and the alpha stays below 256; HD's draw (02B9F63C, also called on
+// its own from 02005CF0) reckons (count + 1) / duration from the count. The fade had run at N+1 times its speed.
+static bool g_in_fader = false;
+static void scale_fader(uint32_t f, int ahead) {  // the caller reckons the alpha from count' + 1, as (count + ahead + t)
+    const uint32_t status = ld32(f), dur = ld16(f + 4), count = ld16(f + 6);
+    if ((status != 2 && status != 3) || !dur) return;
+    const uint32_t n1 = uint32_t(in_between() + 1);
+    const uint32_t d = dur * n1, k = std::min((count + ahead) * n1 + uint32_t(phase()), d - 1);  // alpha < 256
+    st16(f + 4, d);
+    st16(f + 6, k - 1);
+}
+extern "C" void f_02B9F530_orig(Cpu* c);
+extern "C" void hook_02B9F530(Cpu* c) {
+    if (!hold_pass()) return f_02B9F530_orig(c);
+    const uint32_t f = c->r[3];
+    static const uint32_t at[] = {0x00, 0x04, 0x08, 0x1C, 0x20};
+    uint32_t saved[5];
+    for (int i = 0; i < 5; i++) saved[i] = ld32(f + at[i]);
+    st32(f + 0x1C, 0xFFFFFFFF);  // no pending status this pass
+    scale_fader(f, 0);  // the control adds one as it counts
+    g_in_fader = true;
+    f_02B9F530_orig(c);
+    g_in_fader = false;
+    for (int i = 0; i < 5; i++) st32(f + at[i], saved[i]);
+}
+extern "C" void f_02B9F63C_orig(Cpu* c);
+extern "C" void hook_02B9F63C(Cpu* c) {
+    if (!hold_pass() || g_in_fader) return f_02B9F63C_orig(c);
+    const uint32_t f = c->r[3], w = ld32(f + 4);
+    scale_fader(f, 1);
+    f_02B9F63C_orig(c);
+    st32(f + 4, w);
+}
+
+// mDoGph_gInf_c's wide zoom (1012B3C3: cutscenes framed for 4:3 drawn 1.33x larger) is set in execute, read by the
+// painter and camera_draw, and cleared at the end of each painter (offWideZoom 02AEAE60). Hold passes get it as the
+// last logic step left it, before the painter (main01's loop, below) and after it (fpcDt_Handler): every other frame
+// of those cutscenes had been drawn unzoomed.
+static uint8_t g_wide_zoom = 0;
+
+extern "C" void f_02AD6EB0_orig(Cpu* c);
+extern "C" void hook_02AD6EB0(Cpu* c) {  // fpcDt_Handler
+    restore_models();
+    if (hold_pass()) st8(0x1012B3C3, g_wide_zoom);
+    else f_02AD6EB0_orig(c);
+}
+
+extern "C" void f_02AC08B4_orig(Cpu* c);
+extern "C" void hook_02AC08B4(Cpu* c) {  // dScnPly_Draw
+    if (!hold_pass()) return f_02AC08B4_orig(c);
+    const uint32_t counter = ld32(0x1028EBC8);
+    f_02AC08B4_orig(c);
+    st32(0x1028EBC8, counter);
+}
+
+// main01's frame loop (02AF0EDC, the top of each pass): the pass that ended, then the next one (interp.cpp
+// tp_pass_boundary: a logic pass, or a hold pass of the step)
+extern "C" void site_02AF0EDC(Cpu* c) {
+    (void)c;
+    if (record_pass()) g_records++;  // (still the pass that ended)
+    g_passes++;
+    if (!hold_pass()) g_wide_zoom = ld8(0x1012B3C3);  // the pass that ended
+    interp::tp_pass_boundary();
+    if (hold_pass()) {
+        st8(0x1012B3C3, g_wide_zoom);
+        return;
+    }
+    if (g_anms.size() > 16384) g_anms.clear();
+}

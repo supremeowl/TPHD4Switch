@@ -110,6 +110,16 @@ struct MenuTexts {
     const char* rumbleHeading;
     const char* rumble;
     const char* rumbleHelp;
+    const char* sprintHeading;
+    const char* sprint;
+    const char* sprintHelp;
+    const char* sprintKeep;
+    const char* sprintKeepHelp;
+    const char* sprintSpeed;
+    const char* sprintSpeedHelp;
+    const char* captureVideoHeading;
+    const char* captureVideo;
+    const char* captureVideoHelp;
     const char* gyroHeading;
     const char* gyroAim;
     const char* gyroAimHelp;

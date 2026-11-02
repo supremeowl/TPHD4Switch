@@ -28,7 +28,7 @@ enum Item { kItemDeadzone, kItemInvert, kItemRumble, kItemPhone, kItemGyro, kIte
 struct Layout { ImVec2 min[kItemCount], max[kItemCount]; bool drawn[kItemCount] = {}; };
 
 constexpr const char* kHint =
-    "Raise if your stick can't reach full deflection, e.g. the Wind Waker baton's directions don't register.";
+    "Raise if your stick can't reach full deflection.";
 
 // Returns the Changed bits; `v` holds the new values.
 inline unsigned draw(Values& v, Layout* layout = nullptr) {
@@ -55,7 +55,7 @@ inline unsigned draw(Values& v, Layout* layout = nullptr) {
     if (ImGui::Checkbox("Invert camera up/down", &v.invert_camera_y)) changed |= kInvert;
     mark(kItemInvert);
     tip("Camera only, including first-person views and item aiming (bow, hookshot, telescope, Picto Box) and the "
-        "mouse camera. The Wind Waker baton and other right-stick controls are not inverted.");
+        "mouse camera. Other right-stick controls are not inverted.");
     // issue #35: a way to keep the controller motors still (saved; WWHD_RUMBLE=0 starts with it off)
     flow::next(flow::check("Rumble"), gap);
     ImGui::BeginDisabled(!v.rumble_available);

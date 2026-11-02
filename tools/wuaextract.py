@@ -4,7 +4,7 @@ Written from the ZArchive format (github.com/Exzap/ZArchive). Needs: pip install
 
 usage: wuaextract.py ARCHIVE.wua list
        wuaextract.py ARCHIVE.wua extract OUTDIR [TITLE]    TITLE: 16 hex digits or folder name
-                                                           (default: the USA or European base game, 0005000010143500 or 0005000010143600)
+                                                           (default: Twilight Princess HD USA, 000500001019e500)
 """
 import hashlib
 import os
@@ -15,7 +15,7 @@ import sys
 import zstandard
 
 MAGIC, VERSION1, FOOTER, BLOCK = 0x169F52D6, 0x61BF3A01, 144, 65536
-DEFAULT_TITLES = ("0005000010143500", "0005000010143600")  # the base games the port builds from (USA, Europe)
+DEFAULT_TITLES = ("000500001019e500",)  # (TP HD fork) the game the port builds from (USA; was Wind Waker HD's)
 
 
 def be(b):

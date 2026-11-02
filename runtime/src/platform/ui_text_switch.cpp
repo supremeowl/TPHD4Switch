@@ -446,23 +446,19 @@ const MenuTexts kMenuEnglish = {
     .anisoLabel = "Anisotropic filtering",
     .anisoOffTip = "Off, as the game draws it. Default.",
     .anisoTip = "Sharpens textures seen at an angle (the ground ahead, walls along a path) instead of letting them\n"
-        "blur. It costs GPU time, which can lower the frame rate in the busiest views (Outset's tall\n"
-        "grass, the lookout): measured about 5% at 2x, 15% at 4x and 30% at 16x there; the village\n"
-        "and the sea are not affected. Default: 1x (off).",
+        "blur. It costs GPU time, which can lower the frame rate in the busiest views. Default: 1x (off).",
     .shadowLabel = "Shadow maps",
     .shadowFast = "Fast",
     .shadowOriginal = "Original (default)",
     .shadowHigh = "High",
-    .shadowFastTip = "Draws the shadow maps at half the size: about 5-7% more frames per second in the busiest views\n"
-        "(Outset's tall grass, the lookout), but straight shadow edges look wavier.",
+    .shadowFastTip = "Draws the shadow maps at half the size: a little faster in the busiest views, but straight shadow\n"
+        "edges look wavier.",
     .shadowOriginalTip = "The game's own shadow map size, as on the Wii U. Default.",
-    .shadowHighTip = "Draws the shadow maps at twice the size: sharper shadows, but about 17-20% slower in the busiest "
-        "views\n"
-        "(Outset's tall grass, the lookout) and more memory.",
+    .shadowHighTip = "Draws the shadow maps at twice the size: sharper shadows, but slower in the busiest views\n"
+        "and more memory.",
     .ao = "Ambient occlusion",
-    .aoHelp = "The soft dark corners and creases the game adds where surfaces meet. Off draws them flat and is "
-        "about 1%\n"
-        "faster in the busiest views (Outset's tall grass, the lookout); the real shadows stay. Default: on.",
+    .aoHelp = "The soft dark corners and creases the game adds where surfaces meet. Off draws them flat and is\n"
+        "a little faster; the real shadows stay. Default: on.",
     .fxaa = "Edge smoothing (FXAA)",
     .fxaaHelp = "Smoother edges in the 3D world; the HUD stays sharp.\n"
         "Costs a little GPU time (about 2 ms a frame).",
@@ -481,32 +477,46 @@ const MenuTexts kMenuEnglish = {
     .fpsRate = "Frame rate",
     .fpsLoad = "Frame rate and load",
     .fpsOffTip = "No counter.",
-    .fpsRateTip = "Frames per second, top left.",
+    .fpsRateTip = "Frames shown per second, their average and 1% low (the slowest frames) over 10 seconds, top left.",
     .fpsLoadTip = "Frames per second plus the render thread's load, draws and GPU lag.",
-    .fpsHelp = "Shows the frames per second in the top left corner of the picture.",
+    .fpsHelp = "Shows, in the top left corner of the picture, the frames per second the screen shows now, their average\n"
+        "over the last 10 seconds and the 1% low: the slowest 1% of those frames, as frames per second (stutter shows there).",
     // Picture tab: experimental features
     .experimental = "Experimental features",
     .experimentalWarn = "Unfinished: 60 fps needs a big overclock (sys-clk or similar) to hold. Not saved.",
     .fps30 = "30 fps (original)",
     .fps30Tip = "The game as it was: 30 logic steps and 30 drawn frames a second.",
-    .fpsInterp = "60 fps interpolation",
-    .fpsInterpTip = "The game logic keeps 30 steps a second and a blended frame is drawn between them:\n"
-        "doubles the drawing work, so it also needs a big overclock to hold 60 fps.",
+    .fpsInterp = "40 fps interpolation",
+    .fpsInterpTip = "The game logic keeps 30 steps a second; one blended frame is drawn every three steps\n"
+        "(40 frames a second, shown for 1 and 2 refreshes of the 60 Hz screen in turn). A third more drawing work.",
     .fpsTrue60 = "True 60 (experimental)",
     .fpsTrue60Tip = "Runs the game logic at 60 steps a second. Needs a big CPU and GPU overclock (sys-clk) to hold 60 "
         "fps.",
     .fpsModesHelp = "Frame rate modes the game was not made for (the screen is 60 Hz). Not saved: 30 fps at the next "
         "start.",
     .keepSpeed = "Keep game speed",
-    .keepSpeedHelp = "When the console cannot draw 60 frames a second, skip in-between frames instead of slowing\n"
+    .keepSpeedHelp = "When the console cannot draw 40 frames a second, skip in-between frames instead of slowing\n"
         "the whole game down: the game logic keeps its 30 steps a second. Off: every in-between frame\n"
-        "is drawn and the game runs slower than real time. Not saved: off at the next start.",
+        "is drawn and the game runs slower than real time. Not saved: on at the next start.",
     .drawnLately = "In-between frames drawn lately: %.0f%%",
     // Controls tab
     .rumbleHeading = "Rumble",
     .rumble = "Rumble",
     .rumbleHelp = "The Joy-Con or the Pro Controller vibrates when the game asks for it, as the Wii U\n"
         "controllers did. Off keeps the motors still.",
+    .sprintHeading = "Sprint",
+    .sprint = "Hold A to sprint",
+    .sprintHelp = "While Link runs, hold A for a moment to sprint, with the run of the game's scenes; let go to stop.\n"
+        "A tap still rolls. Off: A rolls as soon as it is pressed.",
+    .sprintKeep = "Keep sprinting after letting go of A",
+    .sprintKeepHelp = "Hold A for a moment to start the sprint, then let go: Link keeps sprinting until he stops moving.\n"
+        "A tap of A during it still rolls.",
+    .sprintSpeed = "Sprint speed",
+    .sprintSpeedHelp = "How fast the sprint is. The normal run is 23.",
+    .captureVideoHeading = "Video capture",
+    .captureVideo = "Hold the Capture button to save a video",
+    .captureVideoHelp = "Holding the Capture button saves the last 30 seconds to the Album, as in a normal game. Start the game from its\n"
+        "HOME icon for this. It keeps 96 MB of memory until the game closes. Turn it off if the frame rate drops.",
     .gyroHeading = "Gyro aiming",
     .gyroAim = "Aim with the controller's gyro",
     .gyroAimHelp = "First-person aiming (bow, hookshot, boomerang, telescope, Picto Box, grappling hook) follows\n"
@@ -594,30 +604,20 @@ const MenuTexts kMenuSpanish = {
     .vivid = "Vivos",
     .anisoLabel = "Filtrado anisotrópico",
     .anisoOffTip = "Desactivado, como lo dibuja el juego. Por defecto.",
-    .anisoTip = "Hace más nítidas las texturas vistas en ángulo (el suelo de delante, las paredes de un camino) en "
-        "vez de\n"
-        "dejarlas borrosas. Cuesta tiempo de GPU, que puede bajar los fps en las vistas más cargadas (la "
-        "hierba alta\n"
-        "de Isla Initia, el mirador): medido, un 5% a 2x, un 15% a 4x y un 30% a 16x allí; el pueblo y el "
-        "mar\n"
-        "no se ven afectados. Por defecto: 1x (desactivado).",
+    .anisoTip = "Afina las texturas vistas en ángulo (el suelo de delante, las paredes de un camino) en vez de dejar que\n"
+        "se emborronen. Gasta tiempo de GPU, lo que puede bajar los fps en las vistas más cargadas. Por defecto: 1x (desactivado).",
     .shadowLabel = "Mapas de sombras",
     .shadowFast = "Rápido",
     .shadowOriginal = "Original (por defecto)",
     .shadowHigh = "Alto",
-    .shadowFastTip = "Dibuja los mapas de sombras a la mitad de tamaño: un 5-7% más de fps en las vistas más cargadas\n"
-        "(la hierba alta de Isla Initia, el mirador), pero los bordes rectos de las sombras se ven más "
-        "ondulados.",
+    .shadowFastTip = "Dibuja los mapas de sombras a la mitad de tamaño: algo más rápido en las vistas más cargadas, pero los\n"
+        "bordes rectos de las sombras se ven más ondulados.",
     .shadowOriginalTip = "El tamaño de mapas de sombras del propio juego, como en Wii U. Por defecto.",
-    .shadowHighTip = "Dibuja los mapas de sombras al doble de tamaño: sombras más nítidas, pero un 17-20% más lento en las "
-        "vistas\n"
-        "más cargadas (la hierba alta de Isla Initia, el mirador) y más memoria.",
+    .shadowHighTip = "Dibuja los mapas de sombras al doble de tamaño: sombras más nítidas, pero más lento en las vistas más\n"
+        "cargadas y más memoria.",
     .ao = "Oclusión ambiental",
-    .aoHelp = "Las esquinas y pliegues suavemente oscuros que el juego añade donde se juntan superficies. "
-        "Desactivada, se dibujan\n"
-        "planos y va un 1% más rápido en las vistas más cargadas (la hierba alta de Isla Initia, el mirador); "
-        "las sombras\n"
-        "reales se quedan. Por defecto: activada.",
+    .aoHelp = "Las esquinas y pliegues oscuros y suaves que el juego añade donde se unen las superficies. Desactivado\n"
+        "los dibuja planos y va algo más rápido; las sombras reales se quedan. Por defecto: activado.",
     .fxaa = "Suavizado de bordes (FXAA)",
     .fxaaHelp = "Bordes más suaves en el mundo 3D; el HUD sigue nítido.\n"
         "Cuesta un poco de GPU (unos 2 ms por fotograma).",
@@ -636,36 +636,49 @@ const MenuTexts kMenuSpanish = {
     .fpsRate = "Fps",
     .fpsLoad = "Fps y carga",
     .fpsOffTip = "Sin contador.",
-    .fpsRateTip = "Fotogramas por segundo, arriba a la izquierda.",
+    .fpsRateTip = "Fotogramas mostrados por segundo, su media y el 1% más bajo (los más lentos) en 10 segundos, arriba a "
+        "la izquierda.",
     .fpsLoadTip = "Fotogramas por segundo más la carga del hilo de render, las llamadas de dibujo y el retraso de la "
         "GPU.",
-    .fpsHelp = "Muestra los fotogramas por segundo en la esquina superior izquierda de la imagen.",
+    .fpsHelp = "Muestra en la esquina superior izquierda de la imagen los fotogramas por segundo que se ven ahora, su media\n"
+        "de los últimos 10 segundos y el 1% más bajo: el 1% más lento de esos fotogramas, en fotogramas por segundo (ahí\n"
+        "se notan los tirones).",
     // Picture tab: experimental features
     .experimental = "Funciones experimentales",
     .experimentalWarn = "Sin terminar: mantener 60 fps necesita un gran overclock (sys-clk o similar). No se guarda.",
     .fps30 = "30 fps (original)",
     .fps30Tip = "El juego tal como era: 30 pasos de lógica y 30 fotogramas dibujados por segundo.",
-    .fpsInterp = "Interpolación a 60 fps",
-    .fpsInterpTip = "La lógica del juego sigue a 30 pasos por segundo y se dibuja un fotograma mezclado entre ellos:\n"
-        "duplica el trabajo de dibujo, así que también necesita un gran overclock para mantener 60 fps.",
+    .fpsInterp = "Interpolación a 40 fps",
+    .fpsInterpTip = "La lógica del juego sigue a 30 pasos por segundo; se dibuja un fotograma mezclado cada tres pasos\n"
+        "(40 fotogramas por segundo, mostrados 1 y 2 refrescos de la pantalla de 60 Hz por turnos). Un tercio más de trabajo de dibujo.",
     .fpsTrue60 = "60 reales (experimental)",
     .fpsTrue60Tip = "Ejecuta la lógica del juego a 60 pasos por segundo. Necesita un gran overclock de CPU y GPU "
         "(sys-clk) para mantener 60 fps.",
     .fpsModesHelp = "Modos de fps para los que el juego no se hizo (la pantalla va a 60 Hz). No se guarda: 30 fps en el "
         "siguiente arranque.",
     .keepSpeed = "Mantener la velocidad del juego",
-    .keepSpeedHelp = "Cuando la consola no puede dibujar 60 fotogramas por segundo, se saltan fotogramas intermedios en "
-        "vez de\n"
-        "ralentizar todo el juego: la lógica mantiene sus 30 pasos por segundo. Desactivado: se dibujan todos "
-        "los\n"
-        "intermedios y el juego va más lento que el tiempo real. No se guarda: desactivado en el siguiente "
-        "arranque.",
+    .keepSpeedHelp = "Cuando la consola no puede dibujar 40 fotogramas por segundo, se saltan fotogramas intermedios en vez de\n"
+        "ralentizar todo el juego: la lógica mantiene sus 30 pasos por segundo. Desactivado: se dibujan todos los\n"
+        "intermedios y el juego va más lento que el tiempo real. No se guarda: activado en el siguiente arranque.",
     .drawnLately = "Fotogramas intermedios dibujados últimamente: %.0f%%",
     // Controls tab
     .rumbleHeading = "Vibración",
     .rumble = "Vibración",
     .rumbleHelp = "Los Joy-Con o el mando Pro vibran cuando el juego lo pide, como los mandos de Wii U.\n"
         "Desactivado, los motores no se mueven.",
+    .sprintHeading = "Esprint",
+    .sprint = "Mantén A para esprintar",
+    .sprintHelp = "Mientras Link corre, mantén A un momento para esprintar, con la carrera de las escenas del juego; suelta para parar.\n"
+        "Un toque sigue rodando. Desactivado: A rueda en cuanto se pulsa.",
+    .sprintKeep = "Seguir esprintando al soltar A",
+    .sprintKeepHelp = "Mantén A un momento para empezar a esprintar y suelta: Link sigue esprintando hasta que deja de moverse.\n"
+        "Un toque de A mientras tanto sigue rodando.",
+    .sprintSpeed = "Velocidad del esprint",
+    .sprintSpeedHelp = "Lo rápido que es el esprint. La carrera normal es 23.",
+    .captureVideoHeading = "Captura de vídeo",
+    .captureVideo = "Mantén el botón de captura para guardar un vídeo",
+    .captureVideoHelp = "Mantener el botón de captura guarda los últimos 30 segundos en el Álbum, como en un juego normal. Inicia el juego\n"
+        "desde su icono del menú HOME. Reserva 96 MB de memoria hasta cerrar el juego. Desactívalo si bajan los fps.",
     .gyroHeading = "Apuntado con giroscopio",
     .gyroAim = "Apuntar con el giroscopio del mando",
     .gyroAimHelp = "El apuntado en primera persona (arco, gancho, bumerán, catalejo, Pictógrafo, garfio) sigue\n"
@@ -755,31 +768,20 @@ const MenuTexts kMenuFrench = {
     .vivid = "Vives",
     .anisoLabel = "Filtrage anisotrope",
     .anisoOffTip = "Désactivé, comme le jeu le dessine. Par défaut.",
-    .anisoTip = "Rend plus nettes les textures vues de biais (le sol devant, les murs le long d'un chemin) au lieu "
-        "de\n"
-        "les laisser floues. Cela coûte du temps GPU, ce qui peut baisser les fps dans les vues les plus "
-        "chargées\n"
-        "(les hautes herbes de l'île de l'Aurore, la tour de guet) : mesuré, environ 5 % à 2x, 15 % à 4x et "
-        "30 % à 16x\n"
-        "là-bas ; le village et la mer ne sont pas touchés. Par défaut : 1x (désactivé).",
+    .anisoTip = "Affine les textures vues de biais (le sol devant, les murs le long d'un chemin) au lieu de les laisser\n"
+        "floues. Coûte du temps GPU, ce qui peut baisser les fps dans les vues les plus chargées. Par défaut : 1x (désactivé).",
     .shadowLabel = "Cartes d'ombres",
     .shadowFast = "Rapide",
     .shadowOriginal = "D'origine (par défaut)",
     .shadowHigh = "Élevé",
-    .shadowFastTip = "Dessine les cartes d'ombres à moitié taille : environ 5-7 % de fps en plus dans les vues les plus "
-        "chargées\n"
-        "(les hautes herbes de l'île de l'Aurore, la tour de guet), mais les bords droits des ombres sont "
-        "plus ondulés.",
+    .shadowFastTip = "Dessine les cartes d'ombres à moitié de leur taille : un peu plus rapide dans les vues les plus chargées,\n"
+        "mais les bords droits des ombres sont plus ondulés.",
     .shadowOriginalTip = "La taille d'origine des cartes d'ombres, comme sur Wii U. Par défaut.",
-    .shadowHighTip = "Dessine les cartes d'ombres à double taille : ombres plus nettes, mais environ 17-20 % plus lent "
-        "dans les vues\n"
-        "les plus chargées (les hautes herbes de l'île de l'Aurore, la tour de guet) et plus de mémoire.",
+    .shadowHighTip = "Dessine les cartes d'ombres au double de leur taille : ombres plus nettes, mais plus lent dans les vues\n"
+        "les plus chargées et plus de mémoire.",
     .ao = "Occlusion ambiante",
-    .aoHelp = "Les coins et plis légèrement sombres que le jeu ajoute là où les surfaces se rejoignent. Désactivée, "
-        "ils sont\n"
-        "plats et c'est environ 1 % plus rapide dans les vues les plus chargées (les hautes herbes de l'île "
-        "de l'Aurore,\n"
-        "la tour de guet) ; les vraies ombres restent. Par défaut : activée.",
+    .aoHelp = "Les coins et plis sombres et doux que le jeu ajoute là où les surfaces se rejoignent. Désactivé, ils sont\n"
+        "plats et le jeu est un peu plus rapide ; les vraies ombres restent. Par défaut : activé.",
     .fxaa = "Lissage des contours (FXAA)",
     .fxaaHelp = "Contours plus doux dans le monde 3D ; l'interface reste nette.\n"
         "Coûte un peu de temps GPU (environ 2 ms par image).",
@@ -798,36 +800,48 @@ const MenuTexts kMenuFrench = {
     .fpsRate = "Fps",
     .fpsLoad = "Fps et charge",
     .fpsOffTip = "Pas de compteur.",
-    .fpsRateTip = "Images par seconde, en haut à gauche.",
+    .fpsRateTip = "Images affichées par seconde, leur moyenne et le 1 % le plus bas (les plus lentes) sur 10 secondes, en "
+        "haut à gauche.",
     .fpsLoadTip = "Images par seconde, plus la charge du thread de rendu, les appels de dessin et le retard du GPU.",
-    .fpsHelp = "Affiche les images par seconde dans le coin supérieur gauche de l'image.",
+    .fpsHelp = "Affiche dans le coin supérieur gauche de l'image les images par seconde affichées maintenant, leur moyenne\n"
+        "sur les 10 dernières secondes et le 1 % le plus bas : le 1 % le plus lent de ces images, en images par seconde\n"
+        "(les saccades s'y voient).",
     // Picture tab: experimental features
     .experimental = "Fonctions expérimentales",
     .experimentalWarn = "Inachevé : tenir 60 fps demande un fort overclock (sys-clk ou équivalent). Non enregistré.",
     .fps30 = "30 fps (d'origine)",
     .fps30Tip = "Le jeu tel qu'il était : 30 étapes de logique et 30 images dessinées par seconde.",
-    .fpsInterp = "Interpolation à 60 fps",
-    .fpsInterpTip = "La logique du jeu garde 30 étapes par seconde et une image intermédiaire est dessinée entre elles "
-        ":\n"
-        "le travail de dessin double, il faut donc aussi un fort overclock pour tenir 60 fps.",
+    .fpsInterp = "Interpolation à 40 fps",
+    .fpsInterpTip = "La logique du jeu garde 30 étapes par seconde ; une image intermédiaire est dessinée toutes les trois étapes\n"
+        "(40 images par seconde, affichées 1 et 2 rafraîchissements de l'écran à 60 Hz en alternance). Un tiers de dessin en plus.",
     .fpsTrue60 = "60 réels (expérimental)",
     .fpsTrue60Tip = "Fait tourner la logique du jeu à 60 étapes par seconde. Demande un fort overclock du CPU et du GPU "
         "(sys-clk) pour tenir 60 fps.",
     .fpsModesHelp = "Modes de fps pour lesquels le jeu n'a pas été conçu (l'écran est à 60 Hz). Non enregistré : 30 fps "
         "au prochain démarrage.",
     .keepSpeed = "Garder la vitesse du jeu",
-    .keepSpeedHelp = "Quand la console ne peut pas dessiner 60 images par seconde, des images intermédiaires sont sautées "
-        "au lieu de\n"
-        "ralentir tout le jeu : la logique garde ses 30 étapes par seconde. Désactivé : chaque image "
-        "intermédiaire\n"
-        "est dessinée et le jeu tourne plus lentement que le temps réel. Non enregistré : désactivé au "
-        "prochain démarrage.",
+    .keepSpeedHelp = "Quand la console ne peut pas dessiner 40 images par seconde, des images intermédiaires sont sautées au lieu de\n"
+        "ralentir tout le jeu : la logique garde ses 30 étapes par seconde. Désactivé : chaque image intermédiaire\n"
+        "est dessinée et le jeu tourne plus lentement que le temps réel. Non enregistré : activé au prochain démarrage.",
     .drawnLately = "Images intermédiaires dessinées récemment : %.0f%%",
     // Controls tab
     .rumbleHeading = "Vibrations",
     .rumble = "Vibrations",
     .rumbleHelp = "Les Joy-Con ou la manette Pro vibrent quand le jeu le demande, comme les manettes\n"
         "Wii U. Désactivé, les moteurs restent immobiles.",
+    .sprintHeading = "Sprint",
+    .sprint = "Maintenir A pour sprinter",
+    .sprintHelp = "Quand Link court, maintenez A un instant pour sprinter, avec la course des scènes du jeu ; relâchez pour arrêter.\n"
+        "Un appui bref fait toujours une roulade. Désactivé : A fait une roulade dès l'appui.",
+    .sprintKeep = "Continuer à sprinter en relâchant A",
+    .sprintKeepHelp = "Maintenez A un instant pour commencer à sprinter, puis relâchez : Link sprinte jusqu'à ce qu'il s'arrête.\n"
+        "Un appui bref sur A pendant le sprint fait toujours une roulade.",
+    .sprintSpeed = "Vitesse du sprint",
+    .sprintSpeedHelp = "La vitesse du sprint. La course normale est à 23.",
+    .captureVideoHeading = "Capture vidéo",
+    .captureVideo = "Maintenir le bouton Capture pour enregistrer une vidéo",
+    .captureVideoHelp = "Maintenir le bouton Capture enregistre les 30 dernières secondes dans l'Album, comme dans un jeu normal. Lancez le\n"
+        "jeu depuis son icône du menu HOME. Réserve 96 Mo de mémoire jusqu'à la fermeture. Désactivez-le si les fps baissent.",
     .gyroHeading = "Visée gyroscopique",
     .gyroAim = "Viser avec le gyroscope de la manette",
     .gyroAimHelp = "La visée à la première personne (arc, grappin, boomerang, longue-vue, Picto-box, crochet) suit\n"
@@ -920,30 +934,20 @@ const MenuTexts kMenuGerman = {
     .vivid = "Kräftig",
     .anisoLabel = "Anisotrope Filterung",
     .anisoOffTip = "Aus, wie das Spiel es zeichnet. Standard.",
-    .anisoTip = "Macht schräg gesehene Texturen (der Boden vor dir, Wände entlang eines Weges) scharf, statt sie\n"
-        "verschwimmen zu lassen. Kostet GPU-Zeit und kann die Bildrate in den anspruchsvollsten Ansichten "
-        "senken\n"
-        "(das hohe Gras der Insel Präludien, der Ausguck): gemessen etwa 5 % bei 2x, 15 % bei 4x und 30 % bei "
-        "16x;\n"
-        "das Dorf und das Meer sind nicht betroffen. Standard: 1x (aus).",
+    .anisoTip = "Schärft Texturen, die schräg zu sehen sind (der Boden voraus, Wände entlang eines Wegs), statt sie\n"
+        "verschwimmen zu lassen. Kostet GPU-Zeit, was die Bildrate in den anspruchsvollsten Ansichten senken kann. Standard: 1x (aus).",
     .shadowLabel = "Schattenkarten",
     .shadowFast = "Schnell",
     .shadowOriginal = "Original (Standard)",
     .shadowHigh = "Hoch",
-    .shadowFastTip = "Zeichnet die Schattenkarten in halber Größe: etwa 5-7 % mehr Bilder pro Sekunde in den "
-        "anspruchsvollsten\n"
-        "Ansichten (das hohe Gras der Insel Präludien, der Ausguck), aber gerade Schattenkanten wirken "
-        "welliger.",
+    .shadowFastTip = "Zeichnet die Schattenkarten in halber Größe: etwas schneller in den anspruchsvollsten Ansichten, aber\n"
+        "gerade Schattenkanten wirken welliger.",
     .shadowOriginalTip = "Die Originalgröße der Schattenkarten, wie auf der Wii U. Standard.",
-    .shadowHighTip = "Zeichnet die Schattenkarten in doppelter Größe: schärfere Schatten, aber etwa 17-20 % langsamer in "
-        "den\n"
-        "anspruchsvollsten Ansichten (das hohe Gras der Insel Präludien, der Ausguck) und mehr Speicher.",
+    .shadowHighTip = "Zeichnet die Schattenkarten in doppelter Größe: schärfere Schatten, aber langsamer in den\n"
+        "anspruchsvollsten Ansichten und mehr Speicher.",
     .ao = "Umgebungsverdeckung",
-    .aoHelp = "Die weichen dunklen Ecken und Falten, die das Spiel dort hinzufügt, wo Flächen aufeinandertreffen. "
-        "Aus: flach\n"
-        "gezeichnet und etwa 1 % schneller in den anspruchsvollsten Ansichten (das hohe Gras der Insel "
-        "Präludien, der\n"
-        "Ausguck); die echten Schatten bleiben. Standard: an.",
+    .aoHelp = "Die weichen dunklen Ecken und Falten, die das Spiel fügt, wo Flächen aufeinandertreffen. Aus: Sie werden\n"
+        "flach gezeichnet und es ist etwas schneller; die echten Schatten bleiben. Standard: an.",
     .fxaa = "Kantenglättung (FXAA)",
     .fxaaHelp = "Weichere Kanten in der 3D-Welt; die Anzeige bleibt scharf.\n"
         "Kostet etwas GPU-Zeit (etwa 2 ms pro Bild).",
@@ -962,35 +966,47 @@ const MenuTexts kMenuGerman = {
     .fpsRate = "Bildrate",
     .fpsLoad = "Bildrate und Last",
     .fpsOffTip = "Keine Anzeige.",
-    .fpsRateTip = "Bilder pro Sekunde, oben links.",
+    .fpsRateTip = "Angezeigte Bilder pro Sekunde, ihr Durchschnitt und das 1%-Tief (die langsamsten Bilder) über 10 "
+        "Sekunden, oben links.",
     .fpsLoadTip = "Bilder pro Sekunde plus Last des Render-Threads, Zeichenaufrufe und GPU-Verzögerung.",
-    .fpsHelp = "Zeigt die Bilder pro Sekunde in der oberen linken Ecke des Bildes.",
+    .fpsHelp = "Zeigt oben links im Bild die Bilder pro Sekunde, die gerade angezeigt werden, ihren Durchschnitt der letzten\n"
+        "10 Sekunden und das 1%-Tief: das langsamste 1 % dieser Bilder, in Bildern pro Sekunde (dort zeigen sich Ruckler).",
     // Picture tab: experimental features
     .experimental = "Experimentelle Funktionen",
     .experimentalWarn = "Unfertig: 60 fps zu halten braucht starkes Übertakten (sys-clk o. Ä.). Wird nicht gespeichert.",
     .fps30 = "30 fps (original)",
     .fps30Tip = "Das Spiel wie es war: 30 Logikschritte und 30 gezeichnete Bilder pro Sekunde.",
-    .fpsInterp = "60-fps-Interpolation",
-    .fpsInterpTip = "Die Spiellogik bleibt bei 30 Schritten pro Sekunde, dazwischen wird ein gemischtes Bild "
-        "gezeichnet:\n"
-        "das verdoppelt die Zeichenarbeit, daher braucht es ebenfalls starkes Übertakten für 60 fps.",
+    .fpsInterp = "40-fps-Interpolation",
+    .fpsInterpTip = "Die Spiellogik bleibt bei 30 Schritten pro Sekunde; alle drei Schritte wird ein gemischtes Bild gezeichnet\n"
+        "(40 Bilder pro Sekunde, abwechselnd 1 und 2 Bildwechsel des 60-Hz-Bildschirms lang gezeigt). Ein Drittel mehr Zeichenarbeit.",
     .fpsTrue60 = "Echte 60 (experimentell)",
     .fpsTrue60Tip = "Lässt die Spiellogik mit 60 Schritten pro Sekunde laufen. Braucht starkes CPU- und GPU-Übertakten "
         "(sys-clk), um 60 fps zu halten.",
     .fpsModesHelp = "Bildratenmodi, für die das Spiel nicht gemacht wurde (der Bildschirm hat 60 Hz). Nicht gespeichert: "
         "30 fps beim nächsten Start.",
     .keepSpeed = "Spieltempo halten",
-    .keepSpeedHelp = "Wenn die Konsole keine 60 Bilder pro Sekunde zeichnen kann, werden Zwischenbilder übersprungen, "
-        "statt das\n"
-        "ganze Spiel zu verlangsamen: Die Logik behält ihre 30 Schritte pro Sekunde. Aus: Jedes Zwischenbild "
-        "wird\n"
-        "gezeichnet und das Spiel läuft langsamer als Echtzeit. Nicht gespeichert: aus beim nächsten Start.",
+    .keepSpeedHelp = "Wenn die Konsole keine 40 Bilder pro Sekunde zeichnen kann, werden Zwischenbilder übersprungen, statt das\n"
+        "ganze Spiel zu verlangsamen: Die Logik behält ihre 30 Schritte pro Sekunde. Aus: Jedes Zwischenbild wird\n"
+        "gezeichnet und das Spiel läuft langsamer als Echtzeit. Nicht gespeichert: an beim nächsten Start.",
     .drawnLately = "Zuletzt gezeichnete Zwischenbilder: %.0f%%",
     // Controls tab
     .rumbleHeading = "Vibration",
     .rumble = "Vibration",
     .rumbleHelp = "Die Joy-Con oder der Pro Controller vibrieren, wenn das Spiel es verlangt, wie die\n"
         "Wii-U-Controller. Aus: Die Motoren bleiben still.",
+    .sprintHeading = "Sprint",
+    .sprint = "A halten zum Sprinten",
+    .sprintHelp = "Wenn Link läuft, halte A kurz gedrückt, um zu sprinten, mit dem Lauf aus den Szenen des Spiels; zum Anhalten loslassen.\n"
+        "Kurz drücken rollt weiterhin. Aus: A rollt sofort beim Drücken.",
+    .sprintKeep = "Nach dem Loslassen von A weitersprinten",
+    .sprintKeepHelp = "Halte A kurz gedrückt, um zu sprinten, und lass los: Link sprintet weiter, bis er stehen bleibt.\n"
+        "Kurz A drücken rollt dabei weiterhin.",
+    .sprintSpeed = "Sprinttempo",
+    .sprintSpeedHelp = "Wie schnell der Sprint ist. Der normale Lauf ist 23.",
+    .captureVideoHeading = "Videoaufnahme",
+    .captureVideo = "Aufnahmetaste halten, um ein Video zu speichern",
+    .captureVideoHelp = "Das Halten der Aufnahmetaste speichert die letzten 30 Sekunden im Album, wie in einem normalen Spiel. Starte das Spiel\n"
+        "über sein HOME-Symbol. Belegt 96 MB Speicher, bis das Spiel endet. Schalte es aus, wenn die Bildrate sinkt.",
     .gyroHeading = "Gyro-Zielen",
     .gyroAim = "Mit dem Gyroskop des Controllers zielen",
     .gyroAimHelp = "Das Zielen in der Ich-Perspektive (Bogen, Enterhaken, Bumerang, Fernrohr, Piktobox, Greifhaken)\n"
@@ -1083,31 +1099,20 @@ const MenuTexts kMenuItalian = {
     .vivid = "Vivaci",
     .anisoLabel = "Filtro anisotropico",
     .anisoOffTip = "Disattivato, come lo disegna il gioco. Predefinito.",
-    .anisoTip = "Rende più nitide le texture viste di sbieco (il terreno davanti, i muri lungo un sentiero) invece "
-        "di\n"
-        "lasciarle sfocate. Costa tempo di GPU e può abbassare gli fps nelle visuali più pesanti (l'erba "
-        "alta\n"
-        "dell'Isola Primula, la torre di vedetta): misurato circa il 5% a 2x, il 15% a 4x e il 30% a 16x "
-        "lì;\n"
-        "il villaggio e il mare non ne risentono. Predefinito: 1x (disattivato).",
+    .anisoTip = "Rende nitide le texture viste di sbieco (il terreno davanti, i muri lungo un sentiero) invece di lasciarle\n"
+        "sfocate. Costa tempo di GPU, il che può ridurre i fps nelle visuali più pesanti. Predefinito: 1x (disattivato).",
     .shadowLabel = "Mappe delle ombre",
     .shadowFast = "Veloce",
     .shadowOriginal = "Originale (predefinito)",
     .shadowHigh = "Alto",
-    .shadowFastTip = "Disegna le mappe delle ombre a metà dimensione: circa il 5-7% di fps in più nelle visuali più "
-        "pesanti\n"
-        "(l'erba alta dell'Isola Primula, la torre di vedetta), ma i bordi dritti delle ombre sono più "
-        "ondulati.",
+    .shadowFastTip = "Disegna le mappe delle ombre a metà dimensione: un po' più veloce nelle visuali più pesanti, ma i bordi\n"
+        "dritti delle ombre sono più ondulati.",
     .shadowOriginalTip = "La dimensione originale delle mappe delle ombre, come su Wii U. Predefinito.",
-    .shadowHighTip = "Disegna le mappe delle ombre al doppio della dimensione: ombre più nitide, ma circa il 17-20% più "
-        "lento nelle\n"
-        "visuali più pesanti (l'erba alta dell'Isola Primula, la torre di vedetta) e più memoria.",
+    .shadowHighTip = "Disegna le mappe delle ombre al doppio della dimensione: ombre più nitide, ma più lento nelle visuali più\n"
+        "pesanti e più memoria.",
     .ao = "Occlusione ambientale",
-    .aoHelp = "Gli angoli e le pieghe leggermente scuri che il gioco aggiunge dove le superfici si incontrano. "
-        "Disattivata, sono\n"
-        "piatti ed è circa l'1% più veloce nelle visuali più pesanti (l'erba alta dell'Isola Primula, la "
-        "torre di\n"
-        "vedetta); le ombre vere restano. Predefinito: attivata.",
+    .aoHelp = "Gli angoli e le pieghe scuri e morbidi che il gioco aggiunge dove le superfici si incontrano. Disattivata li\n"
+        "disegna piatti ed è un po' più veloce; le ombre vere restano. Predefinito: attivata.",
     .fxaa = "Smussatura dei bordi (FXAA)",
     .fxaaHelp = "Bordi più morbidi nel mondo 3D; l'interfaccia resta nitida.\n"
         "Costa un po' di tempo di GPU (circa 2 ms per fotogramma).",
@@ -1126,36 +1131,49 @@ const MenuTexts kMenuItalian = {
     .fpsRate = "Fps",
     .fpsLoad = "Fps e carico",
     .fpsOffTip = "Nessun contatore.",
-    .fpsRateTip = "Fotogrammi al secondo, in alto a sinistra.",
+    .fpsRateTip = "Fotogrammi mostrati al secondo, la loro media e l'1% più basso (i più lenti) su 10 secondi, in alto a "
+        "sinistra.",
     .fpsLoadTip = "Fotogrammi al secondo più il carico del thread di rendering, le chiamate di disegno e il ritardo "
         "della GPU.",
-    .fpsHelp = "Mostra i fotogrammi al secondo nell'angolo in alto a sinistra dell'immagine.",
+    .fpsHelp = "Mostra nell'angolo in alto a sinistra dell'immagine i fotogrammi al secondo visualizzati ora, la loro media\n"
+        "degli ultimi 10 secondi e l'1% più basso: l'1% più lento di quei fotogrammi, in fotogrammi al secondo (lì si\n"
+        "vedono gli scatti).",
     // Picture tab: experimental features
     .experimental = "Funzioni sperimentali",
     .experimentalWarn = "Incompleto: tenere 60 fps richiede un forte overclock (sys-clk o simili). Non viene salvato.",
     .fps30 = "30 fps (originale)",
     .fps30Tip = "Il gioco com'era: 30 passi di logica e 30 fotogrammi disegnati al secondo.",
-    .fpsInterp = "Interpolazione a 60 fps",
-    .fpsInterpTip = "La logica del gioco resta a 30 passi al secondo e tra un passo e l'altro si disegna un fotogramma "
-        "fuso:\n"
-        "raddoppia il lavoro di disegno, quindi serve anche un forte overclock per tenere 60 fps.",
+    .fpsInterp = "Interpolazione a 40 fps",
+    .fpsInterpTip = "La logica del gioco resta a 30 passi al secondo; ogni tre passi si disegna un fotogramma fuso\n"
+        "(40 fotogrammi al secondo, mostrati per 1 e 2 aggiornamenti dello schermo a 60 Hz a turno). Un terzo di lavoro di disegno in più.",
     .fpsTrue60 = "60 reali (sperimentale)",
     .fpsTrue60Tip = "Esegue la logica del gioco a 60 passi al secondo. Serve un forte overclock di CPU e GPU (sys-clk) "
         "per tenere 60 fps.",
     .fpsModesHelp = "Modalità di fps per cui il gioco non è stato fatto (lo schermo è a 60 Hz). Non salvato: 30 fps al "
         "prossimo avvio.",
     .keepSpeed = "Mantieni la velocità del gioco",
-    .keepSpeedHelp = "Quando la console non riesce a disegnare 60 fotogrammi al secondo, salta i fotogrammi intermedi "
-        "invece di\n"
-        "rallentare tutto il gioco: la logica mantiene i suoi 30 passi al secondo. Disattivato: ogni "
-        "fotogramma intermedio\n"
-        "viene disegnato e il gioco va più lento del tempo reale. Non salvato: disattivato al prossimo avvio.",
+    .keepSpeedHelp = "Quando la console non riesce a disegnare 40 fotogrammi al secondo, salta i fotogrammi intermedi invece di\n"
+        "rallentare tutto il gioco: la logica mantiene i suoi 30 passi al secondo. Disattivato: ogni fotogramma intermedio\n"
+        "viene disegnato e il gioco va più lento del tempo reale. Non salvato: attivato al prossimo avvio.",
     .drawnLately = "Fotogrammi intermedi disegnati di recente: %.0f%%",
     // Controls tab
     .rumbleHeading = "Vibrazione",
     .rumble = "Vibrazione",
     .rumbleHelp = "I Joy-Con o il controller Pro vibrano quando il gioco lo chiede, come i controller\n"
         "Wii U. Disattivato, i motori restano fermi.",
+    .sprintHeading = "Scatto",
+    .sprint = "Tieni premuto A per scattare",
+    .sprintHelp = "Mentre Link corre, tieni premuto A per un momento per scattare, con la corsa delle scene del gioco; rilascia per fermarti.\n"
+        "Una pressione breve fa ancora la capriola. Disattivato: A fa la capriola appena premuto.",
+    .sprintKeep = "Continua a scattare rilasciando A",
+    .sprintKeepHelp = "Tieni premuto A per un momento per iniziare lo scatto, poi rilascia: Link continua finché non si ferma.\n"
+        "Una pressione breve di A durante lo scatto fa ancora la capriola.",
+    .sprintSpeed = "Velocità dello scatto",
+    .sprintSpeedHelp = "Quanto è veloce lo scatto. La corsa normale è 23.",
+    .captureVideoHeading = "Cattura video",
+    .captureVideo = "Tieni premuto il tasto Cattura per salvare un video",
+    .captureVideoHelp = "Tenere premuto il tasto Cattura salva gli ultimi 30 secondi nell'Album, come in un gioco normale. Avvia il gioco\n"
+        "dalla sua icona del menu HOME. Riserva 96 MB di memoria fino alla chiusura. Disattivalo se i fps calano.",
     .gyroHeading = "Mira giroscopica",
     .gyroAim = "Mira con il giroscopio del controller",
     .gyroAimHelp = "La mira in prima persona (arco, rampino, boomerang, cannocchiale, Pictobox, uncino) segue\n"

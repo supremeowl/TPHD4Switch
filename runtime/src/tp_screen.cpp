@@ -26,6 +26,7 @@
 #include "screen_mode.h"
 #ifdef __SWITCH__
 #include "gfx/switch_renderer.h"
+#include "platform/settings_switch.h"
 #endif
 
 namespace {
@@ -127,4 +128,41 @@ extern "C" void f_02B06D38_orig(Cpu* c);
 extern "C" void hook_02B06D38(Cpu* c) {
     if (gamepad_mode() && !g_in_set_mode && c->r[3] == 0 && ld32(ld32(kControllerMgr) + 0x14) == kModeGamePad) c->r[3] = 1;
     f_02B06D38_orig(c);
+}
+
+// Docked (no touch screen), the menus' items with buttons: the menu manager (02A18EA4, "Collect screen") opens a menu
+// through 02A18794(this, type), which makes the Pro Controller's item screen (zelda_items_procon.blo, at this+0x13C)
+// only when the controller mode is not 3; in GamePad play the items are on the GamePad's touch screen instead. Docked,
+// the mode reads 6 (the Pro Controller's) while it runs, so the item screen is made. (Test: what it shows and whether
+// it takes the GamePad's buttons; once made it stays for that menu manager, handheld too.)
+extern "C" void f_02A18794_orig(Cpu* c);
+static bool docked() {
+#ifdef __SWITCH__
+    return switch_settings::active_mode() == switch_settings::kDocked;
+#else
+    return false;
+#endif
+}
+extern "C" void hook_02A18794(Cpu* c) {
+    const uint32_t mgr = ld32(kControllerMgr), menus = c->r[3];
+    const uint32_t mode = mgr ? ld32(mgr + 0x14) : 0;
+    if (!gamepad_mode() || !docked() || mode != kModeGamePad) { f_02A18794_orig(c); return; }
+    const uint32_t before = ld32(menus + 0x13C), type = c->r[4];
+    st32(mgr + 0x14, 6);
+    f_02A18794_orig(c);
+    st32(mgr + 0x14, mode);
+    const uint32_t after = ld32(menus + 0x13C);
+    LOG("[screen] docked: menu %u opened as with the Pro Controller (its item screen %08X%s)", type, after,
+        after != before ? ", made now" : "");
+}
+
+// The item screen's "Ring to Collect" (the action's check, 02A19520; from the item ring's exit 029FFD0C and its state
+// 02A19680): the only button there that opens another menu. InputMap_game.binput binds it to D-pad down for the GamePad
+// (controller mode 3) and to nothing for the Pro Controller; those columns differ in no other action. Docked, the item
+// screen is the Pro Controller's (above) with the game in mode 3, so it goes as with that controller. D-pad down still
+// opens the Collect screen outside it (the menu manager's 02A18EA4).
+extern "C" void f_02A19520_orig(Cpu* c);
+extern "C" void hook_02A19520(Cpu* c) {
+    if (gamepad_mode() && docked()) { c->r[3] = 0; return; }
+    f_02A19520_orig(c);
 }

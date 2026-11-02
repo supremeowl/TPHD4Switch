@@ -1,5 +1,6 @@
 #pragma once
 
+#include <bit>  // (TP HD fork) std::bit_cast (SwapEndian)
 #include <climits>
 #include <type_traits>
 
@@ -34,17 +35,17 @@ constexpr T SwapEndian(T value)
 
 		return (T)bswap((std::make_unsigned_t<T>)value);
 	}
+	// (TP HD fork) floats and registers through std::bit_cast: *(uint32_t*)&value was type punning, undefined with
+	// strict aliasing (-Wstrict-aliasing); the same bits either way
 	else if constexpr (std::is_floating_point_v<T>)
 	{
 		if constexpr (sizeof(T) == sizeof(uint32_t))
 		{
-			const auto tmp = bswap<uint32_t>(*(uint32_t*)&value);
-			return *(T*)&tmp;
+			return std::bit_cast<T>(bswap<uint32_t>(std::bit_cast<uint32_t>(value)));
 		}
 		if constexpr (sizeof(T) == sizeof(uint64_t))
 		{
-			const auto tmp = bswap<uint64_t>(*(uint64_t*)&value);
-			return *(T*)&tmp;
+			return std::bit_cast<T>(bswap<uint64_t>(std::bit_cast<uint64_t>(value)));
 		}
 	}
 	else if constexpr (std::is_enum_v<T>)
@@ -53,8 +54,7 @@ constexpr T SwapEndian(T value)
 	}
 	else if constexpr (std::is_base_of_v<Latte::LATTEREG, T>)
 	{
-		const auto tmp = bswap<uint32_t>(*(uint32_t*)&value);
-		return *(T*)&tmp;
+		return std::bit_cast<T>(bswap<uint32_t>(std::bit_cast<uint32_t>(value)));
 	}
     else
     {

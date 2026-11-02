@@ -6,3 +6,47 @@
 02008990  # the controller manager's mode setter: mode 3 (GamePad play) in Off-TV Play (tp_screen.cpp)
 02BDE9A4  # Off-TV Play on/off: kept on in GamePad mode (tp_screen.cpp)
 02B06D38  # Off-TV Play's GamePad side: kept on in GamePad mode (tp_screen.cpp)
+02A18794  # the menu manager opens a menu: docked, the Pro Controller's item screen in GamePad mode (tp_screen.cpp)
+# (TP HD fork) frame interpolation (runtime/src/interp_tp.cpp, from AsadSi's TP HD recomp): the loop top, camera,
+# models, materials, particles, and what hold passes skip
+@02AF0EDC
+028E13CC
+02B5CF50
+02B5C544
+02B5C2DC
+02B5D320
+02B58040
+02B17008
+02AC08B4
+02AF0A98
+02AD9F9C
+02003ED8
+02AF09B8
+02AFA7A0
+02AD6EB0
+02AD9664
+02AD6C78
+02AD752C
+0290DD38
+02ACD0A8
+02BEF838
+02B520C4
+02AEAD04
+02919F48
+02A9D7F8
+02B9F530
+02B9F63C
+02902B4C
+028C2AB0
+02ACC800
+0290CDAC
+028C2C00
+02A9D6E4
+02A9D41C
+02AD5B3C
+02A19520  # the item ring's Ring to Collect check: docked, none, as with the Pro Controller (tp_screen.cpp)
+# (TP HD fork) hold A to sprint (runtime/src/tp_sprint.cpp)
+0204D06C  # the front roll's check of a press of A: a tap rolls, a hold waits
+0208DBE8  # daAlink_c::procMove: the sprint's start and end, its top speed
+0202358C  # daAlink_c::setBlendMoveAnime: the sprint's run animation (dashb)
+0208D9D8  # daAlink_c::procWait: a kept sprint ends when Link stops

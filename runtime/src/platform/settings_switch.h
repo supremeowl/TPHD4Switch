@@ -17,9 +17,12 @@ int gpu_profile();                // the one in use
 std::string gpu_profile_status();
 
 // Picture profiles, one per mode (as SwitchWaker's [handheld]/[docked] options): the internal resolution and
-// dynamic resolution. The active mode's profile applies by itself on dock / undock. Defaults: handheld 1x
-// (1280x720), docked 1.5x (1920x1080), dynamic resolution on in both.
+// dynamic resolution. The active mode's profile applies by itself on dock / undock. Defaults (TP HD fork, whose
+// picture is 1920x1080): handheld 0.67x (1280x720, the screen's own size) and docked 1x (Wind Waker HD's 1.5x
+// docked was 720p -> 1080p, here 2880x1620), dynamic resolution on in both. Dynamic resolution goes down to 0.5x
+// (960x540) at most (WWHD_DYNAMIC_RES; gfx/deko/backend.cpp). The menu's choice is a dropdown (overlay_switch.cpp).
 enum Mode : int { kHandheld, kDocked, kModes };
+constexpr float kScale720 = 2.0f / 3.0f;  // (TP HD fork) 1280x720 exactly (saved as "0.67", read back as this)
 const char* mode_label(int m);    // "Handheld" / "Docked"
 int active_mode();
 struct ResProfile {
@@ -43,7 +46,11 @@ constexpr const char* kKeyContrast = "switchContrast";
 constexpr const char* kKeySaturation = "switchSaturation";
 constexpr const char* kKeyGamma = "switchGamma";
 constexpr const char* kKeyFpsCounter = "switchFpsCounter";
+constexpr const char* kKeySprint = "switchSprint";  // (TP HD fork) hold A to sprint (tp_sprint.cpp), off by default
+constexpr const char* kKeySprintKeep = "switchSprintKeep";  // the sprint goes on after A lets go, off by default
+constexpr const char* kKeySprintSpeed = "switchSprintSpeed";  // 0, 1 or 2: tp_sprint.cpp kSprintSpeeds, 1 by default
 constexpr const char* kKeyCaptureCombo = "switchCaptureCombo";
+constexpr const char* kKeyCaptureVideo = "switchCaptureVideo";  // (TP HD fork) the Capture button records, off by default
 constexpr const char* kKeyShadowScale = "switchShadowScale";  // shadow map scale: "0.5" (Fast), "1" (Original, the default), "2" (High)
 constexpr const char* kKeyAmbientOcclusion = "switchAmbientOcclusion";  // "1" on (the default), "0" off (gfxsw::skip_ao)
 constexpr const char* kKeyAnisoLevel = "switchAnisoLevel";  // anisotropic filtering: 1 (off, the default), 2, 4, 8, 16
@@ -75,6 +82,9 @@ void save_picture();       // the current picture adjustments into settings.ini
 // default so it cannot happen by accident (Switch tab; saved)
 bool capture_combo();
 void set_capture_combo(bool on);  // saves it
+// (TP HD fork) holding the Capture button saves a video
+bool capture_video();
+void set_capture_video(bool on);  // saves it
 // the GamePad picture in a corner of the TV picture (gfxsw::gamepad_pip); off by default
 void set_gamepad_pip(bool on);    // saves it
 

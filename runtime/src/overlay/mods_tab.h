@@ -30,6 +30,7 @@
 #include "popup.h"
 #include <algorithm>
 #include <atomic>
+#include <string_view>
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
@@ -1000,8 +1001,10 @@ inline void builtin_list(Host& h) {
     muted(kAreaCaptions[kBuiltin]);
     if (!begin_list("builtin")) return;
     for (const auto& e : mods::manager::entries()) {
-        // the story system needs the Story Notebook package, which only the mod list provides
-        if (e.id == "story-system" && !h.mod_downloads && !find_view(mods::packages::list(), mods::required::kStoryNotebook))
+        // the story system needs the Story Notebook package, which only the mod list provides ((TP HD fork) the id's text
+        // compared: e.id == "story-system" compared two addresses, -Waddress)
+        if (std::string_view(e.id) == "story-system" && !h.mod_downloads &&
+            !find_view(mods::packages::list(), mods::required::kStoryNotebook))
             continue;
         Facts fx;
         fx.builtin = true;
