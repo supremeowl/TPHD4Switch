@@ -3,6 +3,25 @@
 What changed, newest first. A change to the game hooks (`tools/recomp/hooks.txt`) needs the full
 `make_sd.py` build; the others only need the homebrew rebuilt.
 
+## 0.2.0 (2026-11-01)
+
+- **Hold A to sprint** (Controls tab, off by default): a tap still rolls. Link puts his sword away as he starts
+  running. Options to keep sprinting after letting go of A, and a choice of three speeds.
+- **Docked item menu**: when docked, + opens the item screen that works with buttons, since there's no touch screen
+  on the TV. 
+- **Capture button video** (Controls tab, off by default): when the game is started from the HOME screen icon.
+- **Clearer defaults for each screen**: docked now starts at 1x (1920x1080), handheld at 0.67x (1280x720). The Picture
+  tab shows Twilight Princess HD's real sizes, resolution is a dropdown with a new 0.5x choice, and dynamic resolution
+  can go down to 0.5x.
+- **FPS counter**: counts only the frames actually shown on screen.
+- `make_sd.py --wua` finds the game, and `--help` no longer lists Wind Waker's options.
+- Rebuilds pick up header changes, and a source zip unzipped over an older one rebuilds cleanly.
+
+
+
+
+
+
 ## 0.1.0 (2026-10-30)
 
 - Twilight Princess HD (USA, v81) on SwitchWakerHD v1.0.0's Switch runtime
